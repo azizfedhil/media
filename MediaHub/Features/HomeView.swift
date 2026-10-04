@@ -1,5 +1,10 @@
 import SwiftUI
 
+private func recommendations(basedOn last: MetaPreview?) async -> [MetaPreview]? {
+    guard let l = last else { return nil }
+    return try? await TMDBClient.shared.recommendations(for: l.id, type: l.type)
+}
+
 @MainActor @Observable
 final class HomeModel {
     var rows: [CatalogRow] = []
@@ -34,10 +39,7 @@ final class HomeModel {
         guard TMDBClient.shared.hasKey else { suggested = []; return }
         async let movies: [MetaPreview]? = try? TMDBClient.shared.trending("movie")
         async let shows: [MetaPreview]? = try? TMDBClient.shared.trending("tv")
-        async let because: [MetaPreview]? = {
-            guard let l = last else { return nil }
-            return try? await TMDBClient.shared.recommendations(for: l.id, type: l.type)
-        }()
+        async let because: [MetaPreview]? = recommendations(basedOn: last)
         var out: [CatalogRow] = []
         if let l = last, let b = await because, !b.isEmpty {
             out.append(CatalogRow(id: "because", title: "Because you watched \(l.name)", items: b))
