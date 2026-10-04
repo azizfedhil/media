@@ -11,6 +11,7 @@ actor TMDBClient {
         return URLSession(configuration: cfg)
     }()
     private var idCache: [String: Int] = [:]
+    private var seasonCache: [String: [EpisodeInfo]] = [:]
 
     nonisolated var apiKey: String { UserDefaults.standard.string(forKey: "tmdb.key") ?? "" }
     nonisolated var hasKey: Bool { !apiKey.isEmpty }
@@ -20,14 +21,41 @@ actor TMDBClient {
     private struct Page: Decodable { let results: [Item] }
     private struct Find: Decodable { let movieResults: [Item]; let tvResults: [Item] }
     private struct External: Decodable { let imdbId: String? }
-    private struct Season: Decodable { struct E: Decodable {}; let episodes: [E] }
+    private struct SeasonResponse: Decodable { let episodes: [EpisodeInfo] }
+
+    private static let img = "https://image.tmdb.org/t/p/"
+
+    struct SeasonInfo: Decodable, Identifiable, Sendable {
+        let id: Int; let name: String?; let seasonNumber: Int
+        let posterPath: String?; let episodeCount: Int?; let airDate: String?
+        var posterURL: URL? { posterPath.flatMap { URL(string: TMDBClient.img + "w342" + $0) } }
+        var title: String {
+            if let n = name, !n.isEmpty { return n }
+            return seasonNumber == 0 ? "Specials" : "Season \(seasonNumber)"
+        }
+    }
+
+    struct EpisodeInfo: Decodable, Identifiable, Sendable {
+        let id: Int; let name: String?; let overview: String?; let episodeNumber: Int
+        let stillPath: String?; let voteAverage: Double?; let runtime: Int?; let airDate: String?
+        var stillURL: URL? { stillPath.flatMap { URL(string: TMDBClient.img + "w300" + $0) } }
+    }
 
     struct Details: Decodable, Sendable {
         let overview: String?; let tagline: String?; let runtime: Int?; let episodeRunTime: [Int]?
-        let voteAverage: Double?; let genres: [Genre]?; let numberOfSeasons: Int?; let credits: Credits?
-        struct Genre: Decodable, Sendable { let name: String }
-        struct Credits: Decodable, Sendable { let cast: [Person] }
-        struct Person: Decodable, Sendable { let name: String }
+        let voteAverage: Double?; let genres: [Named]?
+        let numberOfSeasons: Int?; let numberOfEpisodes: Int?
+        let credits: Credits?; let seasons: [SeasonInfo]?
+        let networks: [Named]?; let status: String?
+        let productionCompanies: [Named]?; let productionCountries: [Named]?
+        let spokenLanguages: [Language]?; let createdBy: [Named]?
+        let firstAirDate: String?; let lastAirDate: String?; let releaseDate: String?
+        let budget: Int?; let revenue: Int?
+
+        struct Named: Decodable, Sendable { let name: String }
+        struct Language: Decodable, Sendable { let englishName: String? }
+        struct Credits: Decodable, Sendable { let cast: [Person]?; let crew: [Person]? }
+        struct Person: Decodable, Sendable { let name: String; let job: String? }
         var minutes: Int? { runtime ?? episodeRunTime?.first }
     }
 
@@ -44,10 +72,9 @@ actor TMDBClient {
     private func kind(_ type: String) -> String { type == "series" ? "tv" : "movie" }
 
     private func preview(_ i: Item, kind: String) -> MetaPreview {
-        let img = "https://image.tmdb.org/t/p/"
-        return MetaPreview(id: "tmdb:\(i.id)", type: kind == "tv" ? "series" : "movie",
+        MetaPreview(id: "tmdb:\(i.id)", type: kind == "tv" ? "series" : "movie",
             name: i.title ?? i.name ?? "Untitled",
-            poster: i.posterPath.map { img + "w342" + $0 }, background: i.backdropPath.map { img + "w780" + $0 },
+            poster: i.posterPath.map { Self.img + "w342" + $0 }, background: i.backdropPath.map { Self.img + "w780" + $0 },
             logo: nil, description: i.overview, releaseInfo: (i.releaseDate ?? i.firstAirDate).map { String($0.prefix(4)) })
     }
 
@@ -56,9 +83,12 @@ actor TMDBClient {
         return p.results.map { preview($0, kind: kind) }
     }
 
+    /// "More like this": TMDB recommendations, falling back to /similar when there are none.
     func recommendations(for id: String, type: String) async throws -> [MetaPreview] {
         let k = kind(type)
-        let p: Page = try await get("/\(k)/\(try await tmdbID(for: id, type: type))/recommendations")
+        let tid = try await tmdbID(for: id, type: type)
+        var p: Page = try await get("/\(k)/\(tid)/recommendations")
+        if p.results.isEmpty { p = try await get("/\(k)/\(tid)/similar") }
         return p.results.map { preview($0, kind: k) }
     }
 
@@ -66,10 +96,14 @@ actor TMDBClient {
         try await get("/\(kind(type))/\(try await tmdbID(for: id, type: type))", ["append_to_response": "credits"])
     }
 
-    func episodeCount(for id: String, type: String, season: Int) async -> Int? {
+    /// Episodes of one season with still image, overview and TMDB rating.
+    func episodes(for id: String, type: String, season: Int) async -> [EpisodeInfo] {
+        let key = "\(id):\(season)"
+        if let hit = seasonCache[key] { return hit }
         guard let tid = try? await tmdbID(for: id, type: type),
-              let s: Season = try? await get("/tv/\(tid)/season/\(season)") else { return nil }
-        return s.episodes.count
+              let s: SeasonResponse = try? await get("/tv/\(tid)/season/\(season)") else { return [] }
+        seasonCache[key] = s.episodes
+        return s.episodes
     }
 
     func imdbID(tmdb id: Int, type: String) async -> String? {

@@ -51,8 +51,10 @@ actor MDBListClient {
         var out: [Rating] = []
         if let v = by["imdb"] { out.append(Rating(label: "IMDb", text: String(format: "%.1f", v))) }
         if let v = by["tomatoes"] { out.append(Rating(label: "Rotten Tomatoes", text: "\(Int(v))%")) }
+        if let v = by["tomatoesaudience"] ?? by["popcorn"] { out.append(Rating(label: "RT Audience", text: "\(Int(v))%")) }
         if let v = by["metacritic"] { out.append(Rating(label: "Metacritic", text: "\(Int(v))")) }
         if let v = by["letterboxd"] { out.append(Rating(label: "Letterboxd", text: String(format: "%.1f", v))) }
+        if let v = by["trakt"] { out.append(Rating(label: "Trakt", text: "\(Int(v))%")) }
         ratingCache[imdb] = out
         return out
     }

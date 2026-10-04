@@ -93,8 +93,30 @@ struct StreamItem: Decodable, Identifiable, Sendable {
     let url: String?        // directly playable
     let infoHash: String?   // torrent: not playable on iOS without a debrid add-on
     let externalUrl: String?
+    let behaviorHints: Hints?
     var id: String { url ?? infoHash ?? externalUrl ?? UUID().uuidString }
     var isPlayable: Bool { url != nil }
+
+    /// Optional add-on hints. Some debrid add-ons require custom request headers to fetch the file.
+    struct Hints: Decodable, Sendable {
+        let filename: String?
+        let proxyHeaders: ProxyHeaders?
+        struct ProxyHeaders: Decodable, Sendable { let request: [String: String]? }
+        enum K: String, CodingKey { case filename, proxyHeaders }
+        init(from d: Decoder) throws {
+            let c = try d.container(keyedBy: K.self)
+            filename = try? c.decode(String.self, forKey: .filename)
+            proxyHeaders = try? c.decode(ProxyHeaders.self, forKey: .proxyHeaders)
+        }
+    }
+
+    var requestHeaders: [String: String] { behaviorHints?.proxyHeaders?.request ?? [:] }
+    var fileExtension: String {
+        let f = behaviorHints?.filename ?? URL(string: url ?? "")?.lastPathComponent ?? ""
+        return URL(fileURLWithPath: f).pathExtension.lowercased()
+    }
+    /// AVPlayer handles MP4/MOV/HLS; these containers usually fail.
+    var likelyUnsupported: Bool { ["mkv", "avi", "wmv", "flv", "webm"].contains(fileExtension) }
 }
 
 struct CatalogRow: Identifiable, Sendable {
