@@ -11,6 +11,14 @@ targets:
     type: application
     platform: iOS
     sources: [MediaHub]
+    info:
+      path: Config/Info.plist
+      properties:
+        # Needed for Picture in Picture and audio when the app is backgrounded.
+        UIBackgroundModes: [audio]
+        # Lets AVPlayer load plain http:// streams (many debrid links are http). API calls stay on https.
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoadsForMedia: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.example.MediaHub
