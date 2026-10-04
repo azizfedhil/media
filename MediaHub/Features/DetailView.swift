@@ -166,12 +166,14 @@ struct DetailView: View {
         ScrollView(.horizontal) {
             HStack(spacing: 8) {
                 ForEach(allRatings) { r in
-                    VStack(spacing: 2) {
+                    HStack(spacing: 6) {
+                        RatingLogo(label: r.label, value: r.text, height: 20)
                         Text(r.text).font(.headline)
-                        Text(r.label).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
                     }
                     .padding(.horizontal, 12).padding(.vertical, 8)
                     .background(.quaternary, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("\(r.label) \(r.text)")
                 }
             }
         }
@@ -290,8 +292,8 @@ struct DetailView: View {
                 }
                 .overlay(alignment: .topTrailing) {
                     if let r = ep.rating, r > 0 {
-                        HStack(spacing: 3) {
-                            Image(systemName: "star.fill").foregroundStyle(.yellow)
+                        HStack(spacing: 4) {
+                            RatingLogo(label: "TMDB", height: 12)   // episode scores come from TMDB
                             Text(String(format: "%.1f", r))
                         }
                         .font(.caption2.bold()).foregroundStyle(.white)
