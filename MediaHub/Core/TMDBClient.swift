@@ -78,9 +78,32 @@ actor TMDBClient {
             logo: nil, description: i.overview, releaseInfo: (i.releaseDate ?? i.firstAirDate).map { String($0.prefix(4)) })
     }
 
-    func trending(_ kind: String) async throws -> [MetaPreview] {
-        let p: Page = try await get("/trending/\(kind)/week")
+    func trending(_ kind: String, page: Int = 1) async throws -> [MetaPreview] {
+        let p: Page = try await get("/trending/\(kind)/week", ["page": String(page)])
         return p.results.map { preview($0, kind: kind) }
+    }
+
+    // MARK: Network badge (shows only)
+
+    struct NetworkBadge: Sendable { let name: String; let logo: URL? }
+    private struct NetworkEntry: Decodable { let name: String; let logoPath: String? }
+    private struct NetworkList: Decodable { let networks: [NetworkEntry]? }
+    private var networkCache: [String: NetworkBadge] = [:]
+    private var noNetwork: Set<String> = []
+
+    /// First network that has a logo (Netflix, HBO...). Cached per title; failures aren't cached so they retry.
+    func network(for id: String, type: String) async -> NetworkBadge? {
+        guard type == "series" else { return nil }
+        if let hit = networkCache[id] { return hit }
+        if noNetwork.contains(id) { return nil }
+        guard let tid = try? await tmdbID(for: id, type: type),
+              let r: NetworkList = try? await get("/tv/\(tid)") else { return nil }
+        guard let n = r.networks?.first(where: { $0.logoPath != nil }), let path = n.logoPath else {
+            noNetwork.insert(id); return nil
+        }
+        let badge = NetworkBadge(name: n.name, logo: URL(string: Self.img + "w185" + path))
+        networkCache[id] = badge
+        return badge
     }
 
     /// "More like this": TMDB recommendations, falling back to /similar when there are none.
