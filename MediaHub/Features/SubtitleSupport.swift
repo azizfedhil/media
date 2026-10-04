@@ -60,7 +60,9 @@ enum Reflect {
 
     static func cgImage(_ any: Any?, depth: Int = 0) -> CGImage? {
         guard depth < 3, let v = unwrap(any) else { return nil }
-        if let i = v as? CGImage { return i }
+        // `as? CGImage` is rejected for CF types ("will always succeed"); compare CFTypeIDs instead.
+        let obj = v as AnyObject
+        if CFGetTypeID(obj) == CGImage.typeID { return unsafeBitCast(obj, to: CGImage.self) }
         if let u = v as? UIImage { return u.cgImage }
         for c in Mirror(reflecting: v).children { if let i = cgImage(c.value, depth: depth + 1) { return i } }
         return nil
