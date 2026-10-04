@@ -24,6 +24,8 @@ struct AddonManifest: Decodable, Sendable, Hashable {
         }
         /// Home rows can't satisfy required params (e.g. search-only catalogs).
         var isBrowsable: Bool { (extra ?? []).allSatisfy { !($0.isRequired ?? false) } }
+        /// Stremio paging: catalogs that declare a `skip` param can be loaded page by page.
+        var supportsSkip: Bool { (extra ?? []).contains { $0.name == "skip" } }
     }
 
     /// `resources` is either ["stream"] or [{name, types, idPrefixes}].
@@ -119,10 +121,21 @@ struct StreamItem: Decodable, Identifiable, Sendable {
     var likelyUnsupported: Bool { ["mkv", "avi", "wmv", "flv", "webm"].contains(fileExtension) }
 }
 
-struct CatalogRow: Identifiable, Sendable {
+/// Where a Home row came from, so "See all" can keep paging through the same source.
+enum CatalogSource: Sendable {
+    case addon(Addon, AddonManifest.CatalogDef)
+    case tmdbTrending(String)   // "movie" | "tv"
+}
+
+/// Hashable by id only: used as a NavigationLink value, so hashing every item would be wasteful.
+struct CatalogRow: Identifiable, Sendable, Hashable {
     let id: String
     let title: String
     let items: [MetaPreview]
+    var source: CatalogSource? = nil
+
+    static func == (a: CatalogRow, b: CatalogRow) -> Bool { a.id == b.id }
+    func hash(into h: inout Hasher) { h.combine(id) }
 }
 
 private struct MetasResponse: Decodable { let metas: [MetaPreview] }
