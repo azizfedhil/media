@@ -11,6 +11,8 @@ struct PlayRequest: Identifiable {
     let imdb: String
     let season: Int?
     let episode: Int?
+    var episodeTitle: String? = nil
+    var logo: URL? = nil
 }
 
 /// Thin wrapper over AetherEngine (FFmpeg demux + VideoToolbox hardware decode): plays MKV, AVI, WebM and
@@ -23,9 +25,17 @@ final class PlayerModel {
     var duration: Double = 0
     var error: String?
     var scrubbing = false
+    var isPaused = false
+    var audioTracks: [TrackInfo] = []
+    var subtitleTracks: [TrackInfo] = []
+    var activeAudioID: Int?
+    var activeSubtitleID: Int?
+    var activeCues: [SubCue] = []
 
     let engine: AetherEngine?
     @ObservationIgnored private var bag = Set<AnyCancellable>()
+    @ObservationIgnored private var allCues: [SubCue] = []
+    @ObservationIgnored private var sourceTime: Double = 0
 
     init() {
         do { engine = try AetherEngine() }
@@ -51,11 +61,11 @@ final class PlayerModel {
         engine.$state.receive(on: DispatchQueue.main).sink { [weak self] s in
             guard let self else { return }
             switch s {
-            case .playing: isPlaying = true; isBuffering = false; error = nil
-            case .paused: isPlaying = false; isBuffering = false
-            case .loading, .seeking: isBuffering = true
-            case .ended: isPlaying = false; isBuffering = false
-            case .error: isPlaying = false; isBuffering = false; error = "Playback failed (\(String(describing: s)))."
+            case .playing: isPlaying = true; isPaused = false; isBuffering = false; error = nil; refreshTracks()
+            case .paused: isPlaying = false; isPaused = true; isBuffering = false
+            case .loading, .seeking: isBuffering = true; isPaused = false
+            case .ended: isPlaying = false; isPaused = false; isBuffering = false
+            case .error: isPlaying = false; isPaused = false; isBuffering = false; error = "Playback failed (\(String(describing: s)))."
             default: break
             }
         }.store(in: &bag)
@@ -64,6 +74,45 @@ final class PlayerModel {
             guard let self, !scrubbing else { return }
             position = Double(t)
         }.store(in: &bag)
+        // Subtitle cues arrive as one cumulative list in source time; show the ones covering the current frame.
+        engine.$subtitleCues.receive(on: DispatchQueue.main).sink { [weak self] cues in
+            guard let self else { return }
+            allCues = cues.compactMap { SubCue.make($0) }
+            refreshActiveCues()
+        }.store(in: &bag)
+        engine.clock.$sourceTime.receive(on: DispatchQueue.main).sink { [weak self] t in
+            guard let self else { return }
+            sourceTime = Double(t)
+            refreshActiveCues()
+        }.store(in: &bag)
+    }
+
+    private func refreshActiveCues() {
+        guard activeSubtitleID != nil else { if !activeCues.isEmpty { activeCues = [] }; return }
+        let t = sourceTime
+        let now = allCues.filter { $0.start <= t && t < $0.end }
+        if now != activeCues { activeCues = now }
+    }
+
+    func refreshTracks() {
+        guard let engine else { return }
+        audioTracks = engine.audioTracks
+        subtitleTracks = engine.subtitleTracks
+        activeAudioID = Reflect.int(engine.activeAudioTrackIndex)
+        activeSubtitleID = Reflect.int(engine.activeSubtitleTrackIndex)
+        refreshActiveCues()
+    }
+
+    func selectSubtitle(_ t: TrackInfo?) {
+        guard let engine else { return }
+        if let t { engine.selectSubtitleTrack(index: t.id); activeSubtitleID = Reflect.int(t.id) }
+        else { engine.clearSubtitle(); activeSubtitleID = nil; activeCues = [] }
+        refreshActiveCues()
+    }
+
+    func selectAudio(_ t: TrackInfo) {
+        engine?.selectAudioTrack(index: t.id)
+        activeAudioID = Reflect.int(t.id)
     }
 
     func togglePlay() { engine?.togglePlayPause() }
@@ -97,7 +146,10 @@ struct PlayerScreen: View {
         ZStack {
             Color.black.ignoresSafeArea()
             if let engine = model.engine { AetherPlayerSurface(engine: engine).ignoresSafeArea() }
+            SubtitleOverlay(cues: model.activeCues, lift: showControls ? 110 : 0)
+                .animation(.easeInOut(duration: 0.2), value: showControls)
             Color.clear.contentShape(Rectangle()).onTapGesture { toggleControls() }
+            if model.isPaused && model.error == nil { pausedOverlay }
             if model.isBuffering && model.error == nil { ProgressView().controlSize(.large).tint(.white) }
             if showControls || model.error != nil { controls.transition(.opacity) }
             if let e = model.error { errorCard(e) }
@@ -117,6 +169,9 @@ struct PlayerScreen: View {
             if playing && !scrobbled { scrobbled = true; simkl.scrobble("start", request, progress: 0) }
             if playing { scheduleHide() } else { hideTask?.cancel() }
         }
+        .onChange(of: model.isPaused) { _, paused in
+            if paused { withAnimation(.easeInOut(duration: 0.2)) { showControls = true } }
+        }
         .onAppear { UIApplication.shared.isIdleTimerDisabled = true }
         .onDisappear { UIApplication.shared.isIdleTimerDisabled = false; finish() }
     }
@@ -125,9 +180,11 @@ struct PlayerScreen: View {
 
     private var controls: some View {
         VStack {
-            HStack {
+            HStack(alignment: .top, spacing: 10) {
                 glassButton("xmark", size: 44) { dismiss() }
-                Spacer()
+                titleBlock.frame(maxWidth: .infinity, alignment: .leading)
+                if !model.subtitleTracks.isEmpty { subtitleMenu }
+                if model.audioTracks.count > 1 { audioMenu }
             }
             Spacer()
             HStack(spacing: 28) {
@@ -152,6 +209,78 @@ struct PlayerScreen: View {
         }
         .padding(.horizontal, 16).padding(.vertical, 8)
         .foregroundStyle(.white)
+    }
+
+    /// "Series name" over "S1 · E3 · Episode title", or the movie name over its year.
+    private var subtitleLine: String? {
+        if let s = request.season, let e = request.episode {
+            var t = "S\(s) · E\(e)"
+            if let n = request.episodeTitle, !n.isEmpty { t += " · \(n)" }
+            return t
+        }
+        return request.item.releaseInfo
+    }
+
+    private var titleBlock: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(request.item.name).font(.headline).lineLimit(1)
+            if let l = subtitleLine { Text(l).font(.subheadline).foregroundStyle(.white.opacity(0.75)).lineLimit(1) }
+        }
+        .padding(.horizontal, 16).padding(.vertical, 6)
+        .frame(minHeight: 44)
+        .glassEffect(.regular, in: .capsule)
+    }
+
+    private var subtitleMenu: some View {
+        Menu {
+            Button { model.selectSubtitle(nil) } label: {
+                if model.activeSubtitleID == nil { Label("Off", systemImage: "checkmark") } else { Text("Off") }
+            }
+            ForEach(model.subtitleTracks, id: \.id) { t in
+                Button { model.selectSubtitle(t) } label: {
+                    let title = Reflect.trackTitle(t)
+                    if Reflect.int(t.id) == model.activeSubtitleID { Label(title, systemImage: "checkmark") } else { Text(title) }
+                }
+            }
+        } label: {
+            Image(systemName: model.activeSubtitleID == nil ? "captions.bubble" : "captions.bubble.fill")
+                .font(.system(size: 17, weight: .semibold)).frame(width: 44, height: 44)
+        }
+        .glassEffect(.regular.interactive(), in: .circle)
+    }
+
+    private var audioMenu: some View {
+        Menu {
+            ForEach(model.audioTracks, id: \.id) { t in
+                Button { model.selectAudio(t) } label: {
+                    let title = Reflect.trackTitle(t)
+                    if Reflect.int(t.id) == model.activeAudioID { Label(title, systemImage: "checkmark") } else { Text(title) }
+                }
+            }
+        } label: {
+            Image(systemName: "speaker.wave.2").font(.system(size: 17, weight: .semibold)).frame(width: 44, height: 44)
+        }
+        .glassEffect(.regular.interactive(), in: .circle)
+    }
+
+    /// Title art when paused: TVDB clear logo if we have it, else the add-on's logo, else Metahub's, else the name as text.
+    private var logoURL: URL? {
+        if let l = request.logo { return l }
+        if let l = request.item.logo.flatMap(URL.init(string:)) { return l }
+        return URL(string: "https://images.metahub.space/logo/medium/\(request.imdb)/img")
+    }
+
+    private var pausedOverlay: some View {
+        ZStack(alignment: .top) {
+            Color.black.opacity(0.4).ignoresSafeArea()
+            VStack(spacing: 12) {
+                TitleLogo(url: logoURL, fallback: request.item.name).frame(maxWidth: 300, maxHeight: 90)
+                if let l = subtitleLine { Text(l).font(.headline).foregroundStyle(.white.opacity(0.85)) }
+            }
+            .padding(.top, 84)
+        }
+        .allowsHitTesting(false)
+        .transition(.opacity)
     }
 
     private func glassButton(_ symbol: String, size: CGFloat, action: @escaping () -> Void) -> some View {
@@ -233,5 +362,28 @@ struct PlayerScreen: View {
         guard s.isFinite, s >= 0 else { return "0:00" }
         let t = Int(s), h = t / 3600, m = (t % 3600) / 60, sec = t % 60
         return h > 0 ? String(format: "%d:%02d:%02d", h, m, sec) : String(format: "%d:%02d", m, sec)
+    }
+}
+
+/// Loads a title logo through the shared image pipeline; shows the title as text when there is no logo.
+private struct TitleLogo: View {
+    let url: URL?
+    let fallback: String
+    @State private var image: UIImage?
+    @State private var finished = false
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(uiImage: image).resizable().scaledToFit().shadow(color: .black.opacity(0.5), radius: 8)
+            } else if finished {
+                Text(fallback).font(.largeTitle.bold()).multilineTextAlignment(.center).lineLimit(2).foregroundStyle(.white)
+            }
+        }
+        .task(id: url) {
+            finished = false; image = nil
+            if let url { image = await ImagePipeline.shared.image(for: url, maxPixel: 900) }
+            finished = true
+        }
     }
 }

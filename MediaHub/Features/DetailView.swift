@@ -417,7 +417,9 @@ struct DetailView: View {
         guard let u = s.url.flatMap(URL.init(string:)), let imdb = imdbID else { return }
         playRequest = PlayRequest(url: u, headers: s.requestHeaders, item: item,
                                   key: isSeries ? "\(season):\(episode)" : "movie", imdb: imdb,
-                                  season: isSeries ? season : nil, episode: isSeries ? episode : nil)
+                                  season: isSeries ? season : nil, episode: isSeries ? episode : nil,
+                                  episodeTitle: isSeries ? episodes.first(where: { $0.id == episode })?.name : nil,
+                                  logo: logoURL)
     }
 
     private func row(_ addon: Addon, _ s: StreamItem, isPinned: Bool) -> some View {
