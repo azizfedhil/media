@@ -11,19 +11,29 @@ actor TMDBClient {
         return URLSession(configuration: cfg)
     }()
     private var idCache: [String: Int] = [:]
+    private var networkCache: [String: NetworkBadge] = [:]
+    private var networkMisses: Set<String> = []
     private var seasonCache: [String: [EpisodeInfo]] = [:]
 
     nonisolated var apiKey: String { UserDefaults.standard.string(forKey: "tmdb.key") ?? "" }
     nonisolated var hasKey: Bool { !apiKey.isEmpty }
 
     struct Item: Decodable { let id: Int; let title: String?; let name: String?; let overview: String?
-        let posterPath: String?; let backdropPath: String?; let releaseDate: String?; let firstAirDate: String? }
+        let posterPath: String?; let backdropPath: String?; let releaseDate: String?; let firstAirDate: String?
+        let mediaType: String? }
     private struct Page: Decodable { let results: [Item] }
     private struct Find: Decodable { let movieResults: [Item]; let tvResults: [Item] }
     private struct External: Decodable { let imdbId: String? }
     private struct SeasonResponse: Decodable { let episodes: [EpisodeInfo] }
 
     private static let img = "https://image.tmdb.org/t/p/"
+
+    /// Broadcaster / streamer icon shown on show posters.
+    struct NetworkBadge: Sendable { let name: String; let logo: URL? }
+    private struct TVNetworks: Decodable {
+        struct Net: Decodable { let name: String; let logoPath: String? }
+        let networks: [Net]?
+    }
 
     struct SeasonInfo: Decodable, Identifiable, Sendable {
         let id: Int; let name: String?; let seasonNumber: Int
@@ -83,25 +93,26 @@ actor TMDBClient {
         return p.results.map { preview($0, kind: kind) }
     }
 
-    // MARK: Network badge (shows only)
+    /// Movies + shows matching a free-text query.
+    func search(_ query: String) async -> [MetaPreview] {
+        guard hasKey, let p: Page = try? await get("/search/multi", ["query": query, "include_adult": "false"]) else { return [] }
+        return p.results.compactMap { i in
+            guard let t = i.mediaType, t == "movie" || t == "tv" else { return nil }
+            return preview(i, kind: t)
+        }
+    }
 
-    struct NetworkBadge: Sendable { let name: String; let logo: URL? }
-    private struct NetworkEntry: Decodable { let name: String; let logoPath: String? }
-    private struct NetworkList: Decodable { let networks: [NetworkEntry]? }
-    private var networkCache: [String: NetworkBadge] = [:]
-    private var noNetwork: Set<String> = []
-
-    /// First network that has a logo (Netflix, HBO...). Cached per title; failures aren't cached so they retry.
+    /// Network of a show (cached; shows only). One lookup per title, resolved lazily from visible posters.
     func network(for id: String, type: String) async -> NetworkBadge? {
         guard type == "series" else { return nil }
         if let hit = networkCache[id] { return hit }
-        if noNetwork.contains(id) { return nil }
+        if networkMisses.contains(id) { return nil }
         guard let tid = try? await tmdbID(for: id, type: type),
-              let r: NetworkList = try? await get("/tv/\(tid)") else { return nil }
-        guard let n = r.networks?.first(where: { $0.logoPath != nil }), let path = n.logoPath else {
-            noNetwork.insert(id); return nil
+              let t: TVNetworks = try? await get("/tv/\(tid)") else { return nil }
+        guard let n = t.networks?.first(where: { $0.logoPath != nil }) ?? t.networks?.first else {
+            networkMisses.insert(id); return nil
         }
-        let badge = NetworkBadge(name: n.name, logo: URL(string: Self.img + "w185" + path))
+        let badge = NetworkBadge(name: n.name, logo: n.logoPath.flatMap { URL(string: Self.img + "w92" + $0) })
         networkCache[id] = badge
         return badge
     }

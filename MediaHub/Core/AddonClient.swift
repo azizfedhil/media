@@ -25,11 +25,18 @@ actor AddonClient {
         try JSONDecoder().decode(AddonManifest.self, from: try await data(url))
     }
 
-    func catalog(addon: Addon, catalog: AddonManifest.CatalogDef, skip: Int = 0) async throws -> [MetaPreview] {
-        let path = skip > 0
-            ? "catalog/\(catalog.type)/\(catalog.id)/skip=\(skip).json"
-            : "catalog/\(catalog.type)/\(catalog.id).json"
-        let url = addon.baseURL.appendingPathComponent(path)
+    /// `skip` pages through add-ons that declare it; `search` queries add-ons that declare it.
+    func catalog(addon: Addon, catalog: AddonManifest.CatalogDef, skip: Int = 0, search: String? = nil) async throws -> [MetaPreview] {
+        var extras: [String] = []
+        if let q = search?.trimmingCharacters(in: .whitespacesAndNewlines), !q.isEmpty {
+            let safe = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~"))
+            extras.append("search=" + (q.addingPercentEncoding(withAllowedCharacters: safe) ?? q))
+        }
+        if skip > 0 { extras.append("skip=\(skip)") }
+        var path = "catalog/\(catalog.type)/\(catalog.id)"
+        if !extras.isEmpty { path += "/" + extras.joined(separator: "&") }
+        // Built as a string: appendingPathComponent would double-encode the % escapes.
+        guard let url = URL(string: addon.baseURL.absoluteString + path + ".json") else { throw URLError(.badURL) }
         return try MetaPreview.decodeList(try await data(url))
     }
 

@@ -15,7 +15,6 @@ struct MediaHubApp: App {
 }
 
 struct RootView: View {
-    @State private var query = ""
     @Environment(\.scenePhase) private var phase
     @Environment(SimklStore.self) private var simkl
 
@@ -25,13 +24,7 @@ struct RootView: View {
             Tab("Home", systemImage: "house.fill") { HomeView() }
             Tab("Library", systemImage: "books.vertical.fill") { LibraryView() }
             Tab("Settings", systemImage: "gearshape.fill") { SettingsView() }
-            Tab(role: .search) {
-                NavigationStack {
-                    ContentUnavailableView.search(text: query)
-                        .navigationTitle("Search")
-                }
-                .searchable(text: $query)
-            }
+            Tab(role: .search) { SearchView() }
         }
         .tabBarMinimizeBehavior(.onScrollDown)
         .task { await simkl.sync() }

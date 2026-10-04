@@ -59,7 +59,7 @@ struct DetailView: View {
     private var allRatings: [MDBListClient.Rating] {
         var out = ratings
         if let r = details?.voteAverage, r > 0, !out.contains(where: { $0.label == "TMDB" }) {
-            out.append(MDBListClient.Rating(label: "TMDB", text: String(format: "%.1f", r)))
+            out.append(MDBListClient.Rating(label: "TMDB", text: String(format: "%.1f", r), score: r))
         }
         return out
     }
@@ -165,16 +165,7 @@ struct DetailView: View {
     private var ratingsRow: some View {
         ScrollView(.horizontal) {
             HStack(spacing: 8) {
-                ForEach(allRatings) { r in
-                    HStack(spacing: 6) {
-                        RatingLogo(label: r.label, value: r.text, height: 20)
-                        Text(r.text).font(.headline)
-                    }
-                    .padding(.horizontal, 12).padding(.vertical, 8)
-                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                    .accessibilityElement(children: .ignore)
-                    .accessibilityLabel("\(r.label) \(r.text)")
-                }
+                ForEach(allRatings) { RatingBadge(rating: $0) }
             }
         }
         .scrollIndicators(.hidden)
@@ -293,7 +284,7 @@ struct DetailView: View {
                 .overlay(alignment: .topTrailing) {
                     if let r = ep.rating, r > 0 {
                         HStack(spacing: 4) {
-                            RatingLogo(label: "TMDB", height: 12)   // episode scores come from TMDB
+                            RatingLogo(label: "TMDB", height: 11)
                             Text(String(format: "%.1f", r))
                         }
                         .font(.caption2.bold()).foregroundStyle(.white)
@@ -433,14 +424,7 @@ struct DetailView: View {
         Button { play(s) } label: {
             HStack {
                 VStack(alignment: .leading) {
-                    HStack(spacing: 6) {
-                        Text(s.name ?? s.title ?? "Stream").font(.headline)
-                        if s.likelyUnsupported {
-                            Text(s.fileExtension.uppercased()).font(.caption2.bold())
-                                .padding(.horizontal, 6).padding(.vertical, 2)
-                                .background(.orange.opacity(0.25), in: Capsule())
-                        }
-                    }
+                    Text(s.name ?? s.title ?? "Stream").font(.headline)
                     if let t = s.description ?? s.title { Text(t).font(.caption).foregroundStyle(.secondary) }
                 }
                 Spacer()

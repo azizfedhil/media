@@ -1,10 +1,5 @@
 import SwiftUI
 
-private func recommendations(basedOn last: MetaPreview?) async -> [MetaPreview]? {
-    guard let l = last else { return nil }
-    return try? await TMDBClient.shared.recommendations(for: l.id, type: l.type)
-}
-
 @MainActor @Observable
 final class HomeModel {
     var rows: [CatalogRow] = []
@@ -34,18 +29,24 @@ final class HomeModel {
         return src.filter { $0.backdropURL != nil }.prefix(6).map { $0 }
     }
 
+    private nonisolated static func recommendations(after last: MetaPreview?) async -> [MetaPreview] {
+        guard let l = last else { return [] }
+        return (try? await TMDBClient.shared.recommendations(for: l.id, type: l.type)) ?? []
+    }
+
     /// TMDB trending + recommendations based on the last thing you watched.
     func loadSuggestions(last: MetaPreview?) async {
         guard TMDBClient.shared.hasKey else { suggested = []; return }
-        async let movies: [MetaPreview]? = try? TMDBClient.shared.trending("movie")
-        async let shows: [MetaPreview]? = try? TMDBClient.shared.trending("tv")
-        async let because: [MetaPreview]? = recommendations(basedOn: last)
+        async let movies = try? await TMDBClient.shared.trending("movie")
+        async let shows = try? await TMDBClient.shared.trending("tv")
+        async let because = Self.recommendations(after: last)
+        let (m, t, b) = await (movies, shows, because)
         var out: [CatalogRow] = []
-        if let l = last, let b = await because, !b.isEmpty {
+        if let l = last, !b.isEmpty {
             out.append(CatalogRow(id: "because", title: "Because you watched \(l.name)", items: b))
         }
-        if let m = await movies, !m.isEmpty { out.append(CatalogRow(id: "trend-movie", title: "Trending Movies", items: m, source: .tmdbTrending("movie"))) }
-        if let t = await shows, !t.isEmpty { out.append(CatalogRow(id: "trend-tv", title: "Trending Shows", items: t, source: .tmdbTrending("tv"))) }
+        if let m, !m.isEmpty { out.append(CatalogRow(id: "trend-movie", title: "Trending Movies", items: m, source: .tmdbTrending("movie"))) }
+        if let t, !t.isEmpty { out.append(CatalogRow(id: "trend-tv", title: "Trending Shows", items: t, source: .tmdbTrending("tv"))) }
         suggested = out
     }
 
@@ -194,7 +195,7 @@ struct PosterCard: View {
                         LogoImage(url: logo)
                             .frame(maxWidth: 34, maxHeight: 14)
                             .padding(.horizontal, 6).padding(.vertical, 5)
-                            .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                            .background(.white.opacity(0.92), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                             .padding(6)
                             .accessibilityLabel(network?.name ?? "")
                     }

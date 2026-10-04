@@ -8,7 +8,7 @@ actor MDBListClient {
     nonisolated var hasKey: Bool { !apiKey.isEmpty }
 
     struct UserList: Decodable, Identifiable, Sendable { let id: Int; let name: String; let items: Int? }
-    struct Rating: Identifiable, Sendable { let label: String; let text: String; var id: String { label } }
+    struct Rating: Identifiable, Sendable { let label: String; let text: String; var score: Double? = nil; var id: String { label } }
 
     private struct RatingsResponse: Decodable {
         struct R: Decodable { let source: String; let value: Double? }
@@ -49,12 +49,12 @@ actor MDBListClient {
         guard let r: RatingsResponse = try? await get("/imdb/\(type == "series" ? "show" : "movie")/\(imdb)") else { return [] }
         let by = Dictionary(r.ratings?.compactMap { x in x.value.map { (x.source, $0) } } ?? [], uniquingKeysWith: { a, _ in a })
         var out: [Rating] = []
-        if let v = by["imdb"] { out.append(Rating(label: "IMDb", text: String(format: "%.1f", v))) }
-        if let v = by["tomatoes"] { out.append(Rating(label: "Rotten Tomatoes", text: "\(Int(v))%")) }
-        if let v = by["tomatoesaudience"] ?? by["popcorn"] { out.append(Rating(label: "RT Audience", text: "\(Int(v))%")) }
-        if let v = by["metacritic"] { out.append(Rating(label: "Metacritic", text: "\(Int(v))")) }
-        if let v = by["letterboxd"] { out.append(Rating(label: "Letterboxd", text: String(format: "%.1f", v))) }
-        if let v = by["trakt"] { out.append(Rating(label: "Trakt", text: "\(Int(v))%")) }
+        if let v = by["imdb"] { out.append(Rating(label: "IMDb", text: String(format: "%.1f", v), score: v)) }
+        if let v = by["tomatoes"] { out.append(Rating(label: "Rotten Tomatoes", text: "\(Int(v))%", score: v)) }
+        if let v = by["tomatoesaudience"] ?? by["popcorn"] { out.append(Rating(label: "RT Audience", text: "\(Int(v))%", score: v)) }
+        if let v = by["metacritic"] { out.append(Rating(label: "Metacritic", text: "\(Int(v))", score: v)) }
+        if let v = by["letterboxd"] { out.append(Rating(label: "Letterboxd", text: String(format: "%.1f", v), score: v)) }
+        if let v = by["trakt"] { out.append(Rating(label: "Trakt", text: "\(Int(v))%", score: v)) }
         ratingCache[imdb] = out
         return out
     }

@@ -6,18 +6,27 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.0"
+packages:
+  # FFmpeg demux + VideoToolbox hardware decode: plays MKV and every audio codec with native-player battery use.
+  AetherEngine:
+    url: https://github.com/superuser404notfound/AetherEngine
+    from: 7.16.1
 targets:
   MediaHub:
     type: application
     platform: iOS
     sources: [MediaHub]
+    dependencies:
+      - package: AetherEngine
     info:
       path: Config/Info.plist
       properties:
         # Needed for Picture in Picture and audio when the app is backgrounded.
         UIBackgroundModes: [audio]
-        # Lets AVPlayer load plain http:// streams (many debrid links are http). API calls stay on https.
+        # Many debrid links are plain http://. The player engine fetches with URLSession (not AVFoundation),
+        # so it needs the general exception; the ForMedia key alone only covers AVPlayer.
         NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
           NSAllowsArbitraryLoadsForMedia: true
     settings:
       base:

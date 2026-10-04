@@ -18,14 +18,24 @@ struct AddonManifest: Decodable, Sendable, Hashable {
         let id: String
         let name: String?
         let extra: [Extra]?
+        // Older manifests declare extras as plain string lists instead of `extra`.
+        let extraSupported: [String]?
+        let extraRequired: [String]?
         struct Extra: Decodable, Sendable, Hashable {
             let name: String
             let isRequired: Bool?
         }
+        var supportedExtras: Set<String> {
+            Set((extra ?? []).map(\.name) + (extraSupported ?? []) + (extraRequired ?? []))
+        }
+        var requiredExtras: Set<String> {
+            Set((extra ?? []).filter { $0.isRequired ?? false }.map(\.name) + (extraRequired ?? []))
+        }
         /// Home rows can't satisfy required params (e.g. search-only catalogs).
-        var isBrowsable: Bool { (extra ?? []).allSatisfy { !($0.isRequired ?? false) } }
-        /// Stremio paging: catalogs that declare a `skip` param can be loaded page by page.
-        var supportsSkip: Bool { (extra ?? []).contains { $0.name == "skip" } }
+        var isBrowsable: Bool { requiredExtras.isEmpty }
+        var supportsSkip: Bool { supportedExtras.contains("skip") }
+        /// Can answer `search=<query>` without needing any other parameter.
+        var isSearchable: Bool { supportedExtras.contains("search") && requiredExtras.subtracting(["search"]).isEmpty }
     }
 
     /// `resources` is either ["stream"] or [{name, types, idPrefixes}].
@@ -121,19 +131,20 @@ struct StreamItem: Decodable, Identifiable, Sendable {
     var likelyUnsupported: Bool { ["mkv", "avi", "wmv", "flv", "webm"].contains(fileExtension) }
 }
 
-/// Where a Home row came from, so "See all" can keep paging through the same source.
-enum CatalogSource: Sendable {
+/// Where a row came from, so its "See all" page knows how to load more.
+enum CatalogSource: Hashable, Sendable {
+    case none
+    case tmdbTrending(String)                              // "movie" | "tv"
     case addon(Addon, AddonManifest.CatalogDef)
-    case tmdbTrending(String)   // "movie" | "tv"
 }
 
-/// Hashable by id only: used as a NavigationLink value, so hashing every item would be wasteful.
 struct CatalogRow: Identifiable, Sendable, Hashable {
     let id: String
     let title: String
     let items: [MetaPreview]
-    var source: CatalogSource? = nil
+    var source: CatalogSource = .none
 
+    // Identity only: rows are navigation values, not data to compare.
     static func == (a: CatalogRow, b: CatalogRow) -> Bool { a.id == b.id }
     func hash(into h: inout Hasher) { h.combine(id) }
 }

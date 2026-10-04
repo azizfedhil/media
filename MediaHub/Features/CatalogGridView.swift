@@ -1,66 +1,73 @@
 import SwiftUI
 
-/// "See all" page for a row. Starts with the row's items, then keeps paging from the same
-/// source (add-on `skip` paging or TMDB pages) as the last posters scroll into view.
+/// Backs the "See all" page: starts from the row's items, then keeps loading pages as you scroll.
+@MainActor @Observable
+final class GridModel {
+    private(set) var items: [MetaPreview]
+    private(set) var isLoading = false
+    private(set) var hasMore: Bool
+    private let source: CatalogSource
+    private var tmdbPage = 1
+    private var fetched: Int      // raw count served by an add-on so far (its `skip` cursor)
+
+    init(row: CatalogRow) {
+        items = row.items
+        source = row.source
+        fetched = row.items.count
+        switch row.source {
+        case .none: hasMore = false
+        case .tmdbTrending: hasMore = true
+        case .addon(_, let cat): hasMore = cat.supportsSkip
+        }
+    }
+
+    func loadMore() async {
+        guard hasMore, !isLoading else { return }
+        isLoading = true; defer { isLoading = false }
+        var fresh: [MetaPreview] = []
+        switch source {
+        case .none:
+            break
+        case .tmdbTrending(let kind):
+            fresh = (try? await TMDBClient.shared.trending(kind, page: tmdbPage + 1)) ?? []
+            if !fresh.isEmpty { tmdbPage += 1 }
+        case .addon(let addon, let cat):
+            fresh = (try? await AddonClient.shared.catalog(addon: addon, catalog: cat, skip: fetched)) ?? []
+            fetched += fresh.count
+        }
+        let known = Set(items.map(\.id))
+        let new = fresh.filter { !known.contains($0.id) }
+        items += new
+        // Stop when a page is empty or adds nothing new (avoids looping on add-ons that ignore `skip`).
+        hasMore = !new.isEmpty
+    }
+}
+
 struct CatalogGridView: View {
     let row: CatalogRow
-    @State private var items: [MetaPreview]
-    @State private var exhausted: Bool
-    @State private var loading = false
-    @State private var tmdbPage = 1
-    @State private var offset: Int
-
-    private let columns = [GridItem(.adaptive(minimum: 104, maximum: 160), spacing: 12, alignment: .top)]
+    @State private var model: GridModel
+    private let columns = [GridItem(.adaptive(minimum: 104, maximum: 160), spacing: 12)]
 
     init(row: CatalogRow) {
         self.row = row
-        _items = State(initialValue: row.items)
-        _offset = State(initialValue: row.items.count)
-        switch row.source {
-        case .addon(_, let cat): _exhausted = State(initialValue: !cat.supportsSkip)
-        case .tmdbTrending: _exhausted = State(initialValue: false)
-        case nil: _exhausted = State(initialValue: true)
-        }
+        _model = State(initialValue: GridModel(row: row))
     }
 
     var body: some View {
         ScrollView {
-            VStack(spacing: 0) {
-                LazyVGrid(columns: columns, spacing: 16) {
-                    ForEach(items) { item in
-                        VStack(alignment: .leading, spacing: 6) {
-                            PosterCard(item: item, width: nil)
-                            Text(item.name).font(.caption).lineLimit(1)
-                        }
+            LazyVGrid(columns: columns, spacing: 16) {
+                ForEach(model.items) { item in
+                    PosterCard(item: item, width: nil)
                         .onAppear {
-                            if item.id == items.suffix(8).first?.id { Task { await loadMore() } }
+                            if item.id == model.items.last?.id { Task { await model.loadMore() } }
                         }
-                    }
                 }
-                .padding(.horizontal, 16).padding(.top, 8)
-                if loading { ProgressView().frame(maxWidth: .infinity).padding(.vertical, 24) }
             }
-            .padding(.bottom, 40)
+            .padding(.horizontal, 16).padding(.top, 8)
+            if model.isLoading { ProgressView().padding(24) }
         }
         .scrollIndicators(.hidden)
         .navigationTitle(row.title)
         .navigationBarTitleDisplayMode(.inline)
-    }
-
-    private func loadMore() async {
-        guard !loading, !exhausted, let src = row.source else { return }
-        loading = true; defer { loading = false }
-        var fresh: [MetaPreview] = []
-        switch src {
-        case .addon(let addon, let cat):
-            fresh = (try? await AddonClient.shared.catalog(addon: addon, catalog: cat, skip: offset)) ?? []
-            offset += fresh.count
-        case .tmdbTrending(let kind):
-            fresh = (try? await TMDBClient.shared.trending(kind, page: tmdbPage + 1)) ?? []
-            if !fresh.isEmpty { tmdbPage += 1 }
-        }
-        let known = Set(items.map(\.id))
-        let new = fresh.filter { !known.contains($0.id) }
-        if new.isEmpty { exhausted = true } else { items += new }
     }
 }
