@@ -23,6 +23,7 @@ struct LibraryView: View {
             }
             .refreshable { await simkl.sync(force: true) }
             .navigationDestination(for: MetaPreview.self) { DetailView(item: $0) }
+            .navigationDestination(for: CatalogRow.self) { CatalogGridView(row: $0) }
             .navigationTitle("Library")
         }
     }

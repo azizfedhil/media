@@ -42,8 +42,8 @@ final class HomeModel {
         if let l = last, let b = await because, !b.isEmpty {
             out.append(CatalogRow(id: "because", title: "Because you watched \(l.name)", items: b))
         }
-        if let m = await movies, !m.isEmpty { out.append(CatalogRow(id: "trend-movie", title: "Trending Movies", items: m)) }
-        if let t = await shows, !t.isEmpty { out.append(CatalogRow(id: "trend-tv", title: "Trending Shows", items: t)) }
+        if let m = await movies, !m.isEmpty { out.append(CatalogRow(id: "trend-movie", title: "Trending Movies", items: m, source: .tmdbTrending("movie"))) }
+        if let t = await shows, !t.isEmpty { out.append(CatalogRow(id: "trend-tv", title: "Trending Shows", items: t, source: .tmdbTrending("tv"))) }
         suggested = out
     }
 
@@ -58,7 +58,8 @@ final class HomeModel {
                           !items.isEmpty else { return (i, nil) }
                     let kind = cat.type == "movie" ? "Movies" : cat.type == "series" ? "Series" : cat.type.capitalized
                     return (i, CatalogRow(id: "\(addon.id)/\(cat.type)/\(cat.id)",
-                                          title: "\(cat.name ?? cat.id) \(kind)", items: items))
+                                          title: "\(cat.name ?? cat.id) \(kind)", items: items,
+                                          source: .addon(addon, cat)))
                 }
             }
             // Rows appear as each catalog lands; order stays stable.
@@ -98,6 +99,7 @@ struct HomeView: View {
             .scrollIndicators(.hidden)
             .overlay { if model.rows.isEmpty && model.suggested.isEmpty { ProgressView() } }
             .navigationDestination(for: MetaPreview.self) { DetailView(item: $0) }
+            .navigationDestination(for: CatalogRow.self) { CatalogGridView(row: $0) }
             .task(id: store.addons.map(\.id)) { await model.load(addons: store.addons) }
             .task(id: mdbKey + mdbLists) { await model.loadLists(selected: selectedLists) }
             .task(id: tmdbKey + (history.lastWatched?.id ?? "")) { await model.loadSuggestions(last: history.lastWatched) }
@@ -143,10 +145,25 @@ struct CatalogRowView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(row.title).font(.title3.bold()).padding(.horizontal, 16)
+            // Tapping the title opens the full list for this row.
+            NavigationLink(value: row) {
+                HStack(spacing: 4) {
+                    Text(row.title).font(.title3.bold())
+                    Image(systemName: "chevron.right").font(.footnote.weight(.bold)).foregroundStyle(.secondary)
+                }
+            }
+            .buttonStyle(.plain).padding(.horizontal, 16)
             ScrollView(.horizontal) {
                 LazyHStack(spacing: 12) {
                     ForEach(row.items) { PosterCard(item: $0) }
+                    NavigationLink(value: row) {
+                        VStack(spacing: 8) {
+                            Image(systemName: "arrow.right.circle").font(.title)
+                            Text("See all").font(.footnote.weight(.semibold))
+                        }
+                        .foregroundStyle(.secondary).frame(width: 100, height: 195)
+                    }
+                    .buttonStyle(.plain)
                 }
                 .scrollTargetLayout()
             }
@@ -157,15 +174,36 @@ struct CatalogRowView: View {
     }
 }
 
+/// Poster with an optional network icon (shows only). `width: nil` fills its grid column.
 struct PosterCard: View {
     let item: MetaPreview
+    var width: CGFloat? = 130
+    @AppStorage("ui.networkBadges") private var showNetwork = true
+    @State private var network: TMDBClient.NetworkBadge?
 
     var body: some View {
         NavigationLink(value: item) {
-            RemoteImage(url: item.posterURL, size: 130)
-                .frame(width: 130, height: 195)
+            RemoteImage(url: item.posterURL, size: (width ?? 120) * 1.5)
+                .aspectRatio(2.0 / 3.0, contentMode: .fit)
+                .frame(width: width)
                 .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay(alignment: .topLeading) {
+                    if let logo = network?.logo {
+                        LogoImage(url: logo)
+                            .frame(maxWidth: 34, maxHeight: 14)
+                            .padding(.horizontal, 6).padding(.vertical, 5)
+                            .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                            .padding(6)
+                            .accessibilityLabel(network?.name ?? "")
+                    }
+                }
         }
         .buttonStyle(.plain)
+        // Visible cards only (LazyHStack/LazyVGrid); cancelled when scrolled away, cached afterwards.
+        .task(id: item.id) {
+            network = nil
+            guard showNetwork, item.type == "series", TMDBClient.shared.hasKey else { return }
+            network = await TMDBClient.shared.network(for: item.id, type: item.type)
+        }
     }
 }

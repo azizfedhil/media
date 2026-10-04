@@ -8,6 +8,7 @@ struct SettingsView: View {
     @AppStorage("tvdb.key") private var tvdbKey = ""
     @AppStorage("tvdb.pin") private var tvdbPin = ""
     @AppStorage("tmdb.key") private var tmdbKey = ""
+    @AppStorage("ui.networkBadges") private var networkBadges = true
     @State private var urlText = ""
     @State private var error: String?
     @State private var busy = false
@@ -56,6 +57,11 @@ struct SettingsView: View {
                 } header: { Text("Simkl") } footer: {
                     Text("Create a free app at simkl.com/settings/developer to get a client ID.")
                 }
+                Section {
+                    Toggle("Network icons on posters", isOn: $networkBadges)
+                } header: { Text("Interface") } footer: {
+                    Text("Shows the network (Netflix, HBO...) on show posters. Needs a TMDB key and makes one small request per visible poster.")
+                }
                 Section("Add-ons") {
                     ForEach(store.addons) { a in
                         VStack(alignment: .leading) {
@@ -81,6 +87,15 @@ struct SettingsView: View {
                 }
             }
             .navigationTitle("Settings")
+            .scrollDismissesKeyboard(.interactively)
+            .toolbar {
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button("Done") {
+                        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+                    }
+                }
+            }
         }
     }
 }
