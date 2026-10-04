@@ -25,8 +25,11 @@ actor AddonClient {
         try JSONDecoder().decode(AddonManifest.self, from: try await data(url))
     }
 
-    func catalog(addon: Addon, catalog: AddonManifest.CatalogDef) async throws -> [MetaPreview] {
-        let url = addon.baseURL.appendingPathComponent("catalog/\(catalog.type)/\(catalog.id).json")
+    func catalog(addon: Addon, catalog: AddonManifest.CatalogDef, skip: Int = 0) async throws -> [MetaPreview] {
+        let path = skip > 0
+            ? "catalog/\(catalog.type)/\(catalog.id)/skip=\(skip).json"
+            : "catalog/\(catalog.type)/\(catalog.id).json"
+        let url = addon.baseURL.appendingPathComponent(path)
         return try MetaPreview.decodeList(try await data(url))
     }
 
