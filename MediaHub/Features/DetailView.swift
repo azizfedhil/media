@@ -1,5 +1,21 @@
 import SwiftUI
 
+private struct SeasonChip: Identifiable {
+    let id: Int          // season number
+    let title: String
+    let poster: URL?
+    let count: Int?
+}
+
+struct EpisodeItem: Identifiable {
+    let id: Int          // episode number
+    var name: String
+    var overview: String?
+    var image: URL?
+    var rating: Double?
+    var runtime: Int?
+}
+
 struct DetailView: View {
     let item: MetaPreview
     @Environment(AddonStore.self) private var store
@@ -8,7 +24,6 @@ struct DetailView: View {
     @State private var imdbID: String?
     @State private var onWatchlist = false
     @State private var ratings: [MDBListClient.Rating] = []
-    @State private var episodes: [TVDBClient.Episode] = []
     @State private var logoURL: URL?
     @State private var details: TMDBClient.Details?
     @State private var similar: [MetaPreview] = []
@@ -18,18 +33,49 @@ struct DetailView: View {
     @State private var playRequest: PlayRequest?
     @State private var season = 1
     @State private var episode = 1
-    @State private var episodeCount: Int?
+    @State private var episodes: [EpisodeItem] = []
+    @State private var loadingEpisodes = false
+    @State private var seasonsExpanded = false
 
     private var isSeries: Bool { item.type == "series" }
+
+    // MARK: Derived data
 
     private var metaLine: String {
         var parts: [String] = []
         if let y = item.releaseInfo { parts.append(y) }
         if let m = details?.minutes { parts.append("\(m) min") }
-        if let r = details?.voteAverage, r > 0 { parts.append("★ " + String(format: "%.1f", r)) }
         if let g = details?.genres?.prefix(2).map(\.name), !g.isEmpty { parts.append(g.joined(separator: ", ")) }
         return parts.joined(separator: "  ")
     }
+
+    /// TV: broadcaster/streamer. Movies: production studio.
+    private var networkText: String? {
+        let list = (isSeries ? details?.networks : details?.productionCompanies) ?? []
+        let names = list.prefix(2).map(\.name)
+        return names.isEmpty ? nil : names.joined(separator: ", ")
+    }
+
+    private var allRatings: [MDBListClient.Rating] {
+        var out = ratings
+        if let r = details?.voteAverage, r > 0, !out.contains(where: { $0.label == "TMDB" }) {
+            out.append(MDBListClient.Rating(label: "TMDB", text: String(format: "%.1f", r)))
+        }
+        return out
+    }
+
+    private var seasonChips: [SeasonChip] {
+        if let s = details?.seasons, !s.isEmpty {
+            return s.filter { ($0.episodeCount ?? 1) > 0 }
+                .sorted { ($0.seasonNumber == 0 ? Int.max : $0.seasonNumber) < ($1.seasonNumber == 0 ? Int.max : $1.seasonNumber) }
+                .map { SeasonChip(id: $0.seasonNumber, title: $0.title, poster: $0.posterURL, count: $0.episodeCount) }
+        }
+        return (1...max(details?.numberOfSeasons ?? 1, 1)).map {
+            SeasonChip(id: $0, title: "Season \($0)", poster: nil, count: nil)
+        }
+    }
+
+    // MARK: Body
 
     var body: some View {
         ScrollView {
@@ -40,61 +86,13 @@ struct DetailView: View {
                         LinearGradient(colors: [.clear, Color(.systemBackground)], startPoint: .top, endPoint: .bottom)
                             .frame(height: 140)
                     }
-                VStack(alignment: .leading, spacing: 12) {
-                    if let logoURL {
-                        LogoImage(url: logoURL).frame(maxWidth: 260, maxHeight: 90, alignment: .leading)
-                            .accessibilityLabel(item.name)
-                    } else { Text(item.name).font(.largeTitle.bold()) }
-                    if !metaLine.isEmpty { Text(metaLine).font(.subheadline).foregroundStyle(.secondary) }
-                    if !ratings.isEmpty {
-                        ScrollView(.horizontal) {
-                            HStack(spacing: 8) {
-                                ForEach(ratings) { r in
-                                    HStack(spacing: 4) { Text(r.label).foregroundStyle(.secondary); Text(r.text).bold() }
-                                        .font(.footnote).padding(.horizontal, 10).padding(.vertical, 6)
-                                        .background(.quaternary, in: Capsule())
-                                }
-                            }
-                        }
-                        .scrollIndicators(.hidden)
-                    }
-                    if isSeries {
-                        GlassEffectContainer {
-                            HStack {
-                                Stepper("Season \(season)", value: $season, in: 1...max(details?.numberOfSeasons ?? 20, 1))
-                                Stepper("Episode \(episode)", value: $episode, in: 1...max(episodeCount ?? 50, 1))
-                            }
-                            .padding(12).glassEffect(in: .rect(cornerRadius: 16))
-                        }
-                    }
-                    Button { showSources = true } label: {
-                        Label(isSeries ? "Play S\(season):E\(episode)" : "Play", systemImage: "play.fill")
-                            .font(.headline).frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.glassProminent).controlSize(.large)
-                    if simkl.isConnected {
-                        Button {
-                            Task {
-                                if let imdb = await stremioID() { await simkl.addToWatchlist(imdb, type: item.type); onWatchlist = true }
-                            }
-                        } label: {
-                            Label(onWatchlist ? "On your watchlist" : "Add to Watchlist", systemImage: onWatchlist ? "checkmark" : "plus")
-                                .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.glass).disabled(onWatchlist)
-                    }
-                    if let t = details?.tagline, !t.isEmpty { Text(t).italic().foregroundStyle(.secondary) }
-                    if let d = details?.overview ?? item.description { Text(d) }
-                    if let cast = details?.credits?.cast.prefix(6).map(\.name), !cast.isEmpty {
-                        Text("Starring " + cast.joined(separator: ", ")).font(.footnote).foregroundStyle(.secondary)
-                    }
-                }
-                .padding(.horizontal, 20)
-                if !episodes.isEmpty { episodeList }
+                header.padding(.horizontal, 20)
+                if isSeries { seasonSection }
                 if !similar.isEmpty {
                     CatalogRowView(row: CatalogRow(id: "similar-\(item.id)", title: "More like this", items: similar))
                         .padding(.top, 8)
                 }
+                detailsSection
             }
             .padding(.bottom, 40)
         }
@@ -117,52 +115,291 @@ struct DetailView: View {
             guard TVDBClient.shared.hasKey, let imdb = await ensureIMDB() else { return }
             logoURL = await TVDBClient.shared.logo(imdb: imdb, type: item.type)
         }
-        .task(id: season) {
-            guard isSeries, TVDBClient.shared.hasKey, let imdb = await ensureIMDB() else { episodes = []; return }
-            episodes = await TVDBClient.shared.episodes(imdb: imdb, season: season)
-        }
-        .task(id: season) {
-            episode = 1
-            if isSeries { episodeCount = await TMDBClient.shared.episodeCount(for: item.id, type: item.type, season: season) }
-        }
+        .task(id: season) { await loadEpisodes() }
         .task(id: showSources) {
             // Query stream add-ons only when the picker opens.
             guard showSources else { return }
+            streams = []
             loadingStreams = true; defer { loadingStreams = false }
-            guard let imdb = await stremioID() else { streams = []; return }
+            guard let imdb = await stremioID() else { return }
             imdbID = imdb
             let sid = isSeries ? "\(imdb):\(season):\(episode)" : imdb
             streams = await AddonClient.shared.streams(for: sid, type: item.type, addons: store.addons)
         }
     }
 
-    private func ensureIMDB() async -> String? {
-        if imdbID == nil { imdbID = await stremioID() }
-        return imdbID
+    // MARK: Header
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if let logoURL {
+                LogoImage(url: logoURL).frame(maxWidth: 260, maxHeight: 90, alignment: .leading)
+                    .accessibilityLabel(item.name)
+            } else { Text(item.name).font(.largeTitle.bold()) }
+            if !metaLine.isEmpty { Text(metaLine).font(.subheadline).foregroundStyle(.secondary) }
+            if let n = networkText {
+                Label(n, systemImage: isSeries ? "tv" : "building.2").font(.subheadline).foregroundStyle(.secondary)
+            }
+            if !allRatings.isEmpty { ratingsRow }
+            Button { showSources = true } label: {
+                Label(isSeries ? "Play S\(season):E\(episode)" : "Play", systemImage: "play.fill")
+                    .font(.headline).frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.glassProminent).controlSize(.large)
+            if simkl.isConnected {
+                Button {
+                    Task {
+                        if let imdb = await stremioID() { await simkl.addToWatchlist(imdb, type: item.type); onWatchlist = true }
+                    }
+                } label: {
+                    Label(onWatchlist ? "On your watchlist" : "Add to Watchlist", systemImage: onWatchlist ? "checkmark" : "plus")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.glass).disabled(onWatchlist)
+            }
+            if let t = details?.tagline, !t.isEmpty { Text(t).italic().foregroundStyle(.secondary) }
+            if let d = details?.overview ?? item.description { Text(d) }
+        }
     }
 
-    private var episodeList: some View {
+    private var ratingsRow: some View {
+        ScrollView(.horizontal) {
+            HStack(spacing: 8) {
+                ForEach(allRatings) { r in
+                    VStack(spacing: 2) {
+                        Text(r.text).font(.headline)
+                        Text(r.label).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                    .padding(.horizontal, 12).padding(.vertical, 8)
+                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                }
+            }
+        }
+        .scrollIndicators(.hidden)
+    }
+
+    // MARK: Seasons + episodes
+
+    private var seasonSection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Season \(season)").font(.title3.bold())
-            LazyVStack(alignment: .leading, spacing: 14) {
-                ForEach(episodes) { ep in
-                    Button { episode = ep.number ?? 1; showSources = true } label: {
-                        HStack(alignment: .top, spacing: 12) {
-                            RemoteImage(url: ep.imageURL, size: 160).frame(width: 128, height: 72)
-                                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("\(ep.number ?? 0). \(ep.name ?? "Episode")").font(.subheadline.bold()).lineLimit(1)
-                                if let o = ep.overview, !o.isEmpty { Text(o).font(.caption).foregroundStyle(.secondary).lineLimit(3) }
-                                if let r = ep.runtime { Text("\(r) min").font(.caption2).foregroundStyle(.secondary) }
-                            }
-                            Spacer(minLength: 0)
+            HStack {
+                Text("Seasons").font(.title3.bold())
+                Spacer()
+                if seasonChips.contains(where: { $0.poster != nil }) {
+                    Button { withAnimation(.snappy) { seasonsExpanded.toggle() } } label: {
+                        HStack(spacing: 4) {
+                            Text("Artwork")
+                            Image(systemName: "chevron.down").rotationEffect(.degrees(seasonsExpanded ? 180 : 0))
                         }
+                        .font(.subheadline)
+                    }
+                }
+            }
+            .padding(.horizontal, 20)
+            seasonPills
+            if seasonsExpanded { seasonPosters.transition(.opacity.combined(with: .move(edge: .top))) }
+            episodeCarousel
+        }
+    }
+
+    private func select(season n: Int) {
+        guard n != season else { return }
+        withAnimation(.snappy) { season = n; episode = 1; episodes = [] }
+    }
+
+    private var seasonPills: some View {
+        ScrollView(.horizontal) {
+            HStack(spacing: 8) {
+                ForEach(seasonChips) { c in
+                    Button { select(season: c.id) } label: {
+                        Text(c.title).font(.subheadline.weight(.semibold))
+                            .padding(.horizontal, 16).padding(.vertical, 9)
+                            .glassEffect(c.id == season ? .regular.tint(.accentColor).interactive() : .regular.interactive(),
+                                         in: .capsule)
                     }
                     .buttonStyle(.plain)
                 }
             }
+            .padding(.horizontal, 20)
         }
-        .padding(.horizontal, 20).padding(.top, 8)
+        .scrollIndicators(.hidden)
+    }
+
+    private var seasonPosters: some View {
+        ScrollView(.horizontal) {
+            HStack(alignment: .top, spacing: 12) {
+                ForEach(seasonChips) { c in
+                    Button { select(season: c.id) } label: {
+                        VStack(alignment: .leading, spacing: 6) {
+                            RemoteImage(url: c.poster, size: 110).frame(width: 110, height: 165)
+                                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                                .overlay {
+                                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                        .strokeBorder(Color.accentColor, lineWidth: c.id == season ? 3 : 0)
+                                }
+                            Text(c.title).font(.caption.weight(.medium)).lineLimit(1)
+                            if let n = c.count { Text("\(n) episodes").font(.caption2).foregroundStyle(.secondary) }
+                        }
+                        .frame(width: 110, alignment: .leading)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 20)
+        }
+        .scrollIndicators(.hidden)
+    }
+
+    private var episodeCarousel: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ScrollView(.horizontal) {
+                LazyHStack(spacing: 12) {
+                    if loadingEpisodes && episodes.isEmpty {
+                        ProgressView().frame(width: 280, height: 158)
+                    }
+                    ForEach(episodes) { episodeCard($0) }
+                }
+                .scrollTargetLayout()
+            }
+            .contentMargins(.horizontal, 20, for: .scrollContent)
+            .scrollTargetBehavior(.viewAligned)
+            .scrollIndicators(.hidden)
+            // No TMDB/TVDB data: keep a manual way to pick the episode.
+            if episodes.isEmpty && !loadingEpisodes {
+                Stepper("Episode \(episode)", value: $episode, in: 1...99).padding(.horizontal, 20)
+            }
+        }
+    }
+
+    private func episodeCard(_ ep: EpisodeItem) -> some View {
+        let selected = ep.id == episode
+        return Button { episode = ep.id; showSources = true } label: {
+            RemoteImage(url: ep.image, size: 300)
+                .frame(width: 280, height: 158)
+                .overlay(alignment: .bottom) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("\(ep.id). \(ep.name)").font(.subheadline.bold()).lineLimit(1)
+                        if let o = ep.overview, !o.isEmpty {
+                            Text(o).font(.caption).lineLimit(2).opacity(0.85)
+                        }
+                    }
+                    .foregroundStyle(.white)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12).padding(.bottom, 10).padding(.top, 36)
+                    .background(LinearGradient(colors: [.clear, .black.opacity(0.85)], startPoint: .top, endPoint: .bottom))
+                }
+                .overlay(alignment: .topTrailing) {
+                    if let r = ep.rating, r > 0 {
+                        HStack(spacing: 3) {
+                            Image(systemName: "star.fill").foregroundStyle(.yellow)
+                            Text(String(format: "%.1f", r))
+                        }
+                        .font(.caption2.bold()).foregroundStyle(.white)
+                        .padding(.horizontal, 8).padding(.vertical, 4)
+                        .background(.black.opacity(0.6), in: Capsule())
+                        .padding(8)
+                    }
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .strokeBorder(Color.accentColor, lineWidth: selected ? 3 : 0)
+                }
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// TMDB first (stills, overviews, ratings); TVDB fills missing thumbnails or stands in when TMDB has nothing.
+    private func loadEpisodes() async {
+        guard isSeries else { return }
+        loadingEpisodes = true
+        var list = await TMDBClient.shared.episodes(for: item.id, type: item.type, season: season).map {
+            EpisodeItem(id: $0.episodeNumber, name: $0.name ?? "Episode \($0.episodeNumber)", overview: $0.overview,
+                        image: $0.stillURL, rating: $0.voteAverage, runtime: $0.runtime)
+        }
+        let needsArt = list.contains(where: { $0.image == nil })
+        if (list.isEmpty || needsArt), TVDBClient.shared.hasKey, let imdb = await ensureIMDB() {
+            let tv = await TVDBClient.shared.episodes(imdb: imdb, season: season)
+            if list.isEmpty {
+                list = tv.compactMap { e in
+                    e.number.map { EpisodeItem(id: $0, name: e.name ?? "Episode \($0)", overview: e.overview,
+                                               image: e.imageURL, rating: nil, runtime: e.runtime) }
+                }
+            } else {
+                for i in list.indices where list[i].image == nil {
+                    list[i].image = tv.first(where: { $0.number == list[i].id })?.imageURL
+                }
+            }
+        }
+        guard !Task.isCancelled else { return }
+        episodes = list
+        loadingEpisodes = false
+    }
+
+    // MARK: Details footer
+
+    private var detailRows: [(String, String)] {
+        guard let d = details else { return [] }
+        var rows: [(String, String)] = []
+        func add(_ k: String, _ v: String?) { if let v, !v.isEmpty { rows.append((k, v)) } }
+        func names(_ a: [TMDBClient.Details.Named]?) -> String? { a?.map(\.name).joined(separator: ", ") }
+        func money(_ n: Int?) -> String? {
+            guard let n, n > 0 else { return nil }
+            return n.formatted(.currency(code: "USD").precision(.fractionLength(0)))
+        }
+        if isSeries {
+            add("Network", names(d.networks))
+            add("Status", d.status)
+            add("First aired", prettyDate(d.firstAirDate))
+            add("Last aired", prettyDate(d.lastAirDate))
+            add("Seasons", d.numberOfSeasons.map(String.init))
+            add("Episodes", d.numberOfEpisodes.map(String.init))
+            add("Created by", names(d.createdBy))
+        } else {
+            add("Released", prettyDate(d.releaseDate))
+            add("Director", d.credits?.crew?.filter { $0.job == "Director" }.map(\.name).joined(separator: ", "))
+            add("Budget", money(d.budget))
+            add("Box office", money(d.revenue))
+        }
+        add("Runtime", d.minutes.map { "\($0) min" })
+        add("Genres", names(d.genres))
+        add("Studio", names(d.productionCompanies))
+        add("Country", names(d.productionCountries))
+        add("Languages", d.spokenLanguages?.compactMap(\.englishName).joined(separator: ", "))
+        add("Cast", d.credits?.cast?.prefix(10).map(\.name).joined(separator: ", "))
+        return rows
+    }
+
+    private func prettyDate(_ s: String?) -> String? {
+        guard let s else { return nil }
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "yyyy-MM-dd"
+        return f.date(from: s)?.formatted(date: .long, time: .omitted)
+    }
+
+    @ViewBuilder private var detailsSection: some View {
+        let rows = detailRows
+        if !rows.isEmpty {
+            VStack(alignment: .leading, spacing: 0) {
+                Text(isSeries ? "About the show" : "About the movie").font(.title3.bold()).padding(.bottom, 8)
+                ForEach(rows, id: \.0) { row in
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(row.0).font(.caption).foregroundStyle(.secondary)
+                        Text(row.1).font(.subheadline)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 8)
+                    Divider()
+                }
+            }
+            .padding(.horizontal, 20).padding(.top, 8)
+        }
+    }
+
+    // MARK: IDs
+
+    private func ensureIMDB() async -> String? {
+        if imdbID == nil { imdbID = await stremioID() }
+        return imdbID
     }
 
     private func stremioID() async -> String? {
@@ -185,7 +422,8 @@ struct DetailView: View {
 
     private func play(_ s: StreamItem) {
         guard let u = s.url.flatMap(URL.init(string:)), let imdb = imdbID else { return }
-        playRequest = PlayRequest(url: u, item: item, key: isSeries ? "\(season):\(episode)" : "movie", imdb: imdb,
+        playRequest = PlayRequest(url: u, headers: s.requestHeaders, item: item,
+                                  key: isSeries ? "\(season):\(episode)" : "movie", imdb: imdb,
                                   season: isSeries ? season : nil, episode: isSeries ? episode : nil)
     }
 
@@ -193,7 +431,14 @@ struct DetailView: View {
         Button { play(s) } label: {
             HStack {
                 VStack(alignment: .leading) {
-                    Text(s.name ?? s.title ?? "Stream").font(.headline)
+                    HStack(spacing: 6) {
+                        Text(s.name ?? s.title ?? "Stream").font(.headline)
+                        if s.likelyUnsupported {
+                            Text(s.fileExtension.uppercased()).font(.caption2.bold())
+                                .padding(.horizontal, 6).padding(.vertical, 2)
+                                .background(.orange.opacity(0.25), in: Capsule())
+                        }
+                    }
                     if let t = s.description ?? s.title { Text(t).font(.caption).foregroundStyle(.secondary) }
                 }
                 Spacer()
