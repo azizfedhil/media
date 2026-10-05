@@ -22,6 +22,7 @@ struct DetailView: View {
     @Environment(SimklStore.self) private var simkl
     @Environment(PinnedSources.self) private var pins
     @Environment(WatchHistory.self) private var history
+    @Environment(LocalLibrary.self) private var library
     @Environment(ThemeStore.self) private var theme
     @State private var imdbID: String?
     @State private var onWatchlist = false
@@ -162,9 +163,47 @@ struct DetailView: View {
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.glass).disabled(onWatchlist)
+            } else {
+                localLibraryMenu
             }
             if let t = details?.tagline, !t.isEmpty { Text(t).italic().foregroundStyle(.secondary) }
             if let d = details?.overview ?? item.description { Text(d) }
+        }
+    }
+
+    // MARK: Local library (used when Simkl isn't connected; belongs to the active profile)
+
+    private var localLibraryMenu: some View {
+        let status = library.entry(for: item.id)?.status
+        return Menu {
+            if status != .planToWatch {
+                Button("Add to Watchlist", systemImage: "bookmark") { saveLocal(.planToWatch) }
+            }
+            if status != .watched {
+                Button("Mark as Watched", systemImage: "checkmark.circle") { saveLocal(.watched) }
+            }
+            if status != nil {
+                Button("Remove from Library", systemImage: "trash", role: .destructive) {
+                    withAnimation { library.remove(item.id) }
+                }
+            }
+        } label: {
+            switch status {
+            case .planToWatch: Label("On your watchlist", systemImage: "bookmark.fill").frame(maxWidth: .infinity)
+            case .watched: Label("Watched", systemImage: "checkmark.circle.fill").frame(maxWidth: .infinity)
+            case nil: Label("Add to Watchlist", systemImage: "plus").frame(maxWidth: .infinity)
+            }
+        }
+        .buttonStyle(.glass)
+    }
+
+    /// Saves instantly, then looks up the title's other id in the background so it is recognised from any source.
+    private func saveLocal(_ status: LocalLibrary.Status) {
+        let isNew = library.entry(for: item.id) == nil
+        library.set(item, status: status)
+        guard isNew else { return }
+        Task {
+            if let other = await stremioID(), other != item.id { library.setAlias(other, for: item.id) }
         }
     }
 
