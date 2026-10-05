@@ -367,6 +367,7 @@ struct PlayerScreen: View {
     let provider: EpisodeProvider?
     let onClose: () -> Void
     @Environment(WatchHistory.self) private var history
+    @Environment(LocalLibrary.self) private var library
     @Environment(SimklStore.self) private var simkl
     @Environment(ThemeStore.self) private var theme
     @Environment(AddonStore.self) private var store
@@ -1014,6 +1015,8 @@ struct PlayerScreen: View {
         history.update(current.item, key: current.key, position: p, duration: d,
                        season: current.season, episode: current.episode,
                        episodeTitle: current.episodeTitle, thumb: current.thumb?.absoluteString)
+        // A saved movie that has been watched through moves to "Watched" (Simkl does this itself when connected).
+        if current.item.type == "movie", p >= d * 0.92 { library.markWatchedIfSaved(current.item.id) }
     }
 
     /// Saves progress and tells Simkl we stopped. Used when leaving an episode (close or switch).
