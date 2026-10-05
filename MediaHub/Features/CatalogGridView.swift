@@ -46,28 +46,77 @@ final class GridModel {
 struct CatalogGridView: View {
     let row: CatalogRow
     @State private var model: GridModel
-    private let columns = [GridItem(.adaptive(minimum: 104, maximum: 160), spacing: 12)]
+    @State private var order: Order = .newest
+    private let columns = [GridItem(.adaptive(minimum: 104, maximum: 160), spacing: 12, alignment: .top)]
+
+    enum Order: String, CaseIterable, Identifiable {
+        case newest = "Newest first"
+        case oldest = "Oldest first"
+        case original = "Original order"
+        var id: String { rawValue }
+    }
 
     init(row: CatalogRow) {
         self.row = row
         _model = State(initialValue: GridModel(row: row))
     }
 
+    private struct YearSection { let title: String; let items: [MetaPreview] }
+
+    /// Grouped by release year; within a year the source order is kept.
+    private var sections: [YearSection] {
+        if order == .original { return [YearSection(title: "", items: model.items)] }
+        let groups = Dictionary(grouping: model.items) { $0.year }
+        let years = groups.keys.compactMap { $0 }.sorted { order == .newest ? $0 > $1 : $0 < $1 }
+        var out = years.map { YearSection(title: String($0), items: groups[$0] ?? []) }
+        if let unknown = groups[Int?.none], !unknown.isEmpty {
+            out.append(YearSection(title: "Unknown year", items: unknown))
+        }
+        return out
+    }
+
     var body: some View {
         ScrollView {
-            LazyVGrid(columns: columns, spacing: 16) {
-                ForEach(model.items) { item in
-                    PosterCard(item: item, width: nil)
-                        .onAppear {
-                            if item.id == model.items.last?.id { Task { await model.loadMore() } }
+            LazyVStack(alignment: .leading, spacing: 0, pinnedViews: [.sectionHeaders]) {
+                ForEach(sections, id: \.title) { sec in
+                    Section {
+                        LazyVGrid(columns: columns, spacing: 18) {
+                            ForEach(sec.items) { PosterCard(item: $0, width: nil, showsTitle: true) }
                         }
+                        .padding(.horizontal, 16).padding(.bottom, 22)
+                    } header: {
+                        if !sec.title.isEmpty { header(sec) }
+                    }
                 }
+                // Reaching the bottom loads the next page; re-fires after each page until the screen is full.
+                Color.clear.frame(height: 1).task(id: model.items.count) { await model.loadMore() }
+                if model.isLoading { ProgressView().frame(maxWidth: .infinity).padding(24) }
             }
-            .padding(.horizontal, 16).padding(.top, 8)
-            if model.isLoading { ProgressView().padding(24) }
         }
         .scrollIndicators(.hidden)
         .navigationTitle(row.title)
+        .navigationSubtitle("\(model.items.count) titles")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Menu {
+                    Picker("Order", selection: $order) {
+                        ForEach(Order.allCases) { Text($0.rawValue).tag($0) }
+                    }
+                } label: { Image(systemName: "calendar") }
+            }
+        }
+        .animation(.smooth(duration: 0.35), value: order)
+    }
+
+    private func header(_ sec: YearSection) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(sec.title).font(.title3.bold())
+            Text("\(sec.items.count)").font(.subheadline.weight(.medium)).foregroundStyle(.secondary)
+            Spacer()
+        }
+        .padding(.horizontal, 16).padding(.vertical, 8)
+        .frame(maxWidth: .infinity)
+        .background(.bar)
     }
 }

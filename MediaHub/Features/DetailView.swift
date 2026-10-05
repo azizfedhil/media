@@ -7,17 +7,15 @@ private struct SeasonChip: Identifiable {
     let count: Int?
 }
 
-struct EpisodeItem: Identifiable {
-    let id: Int          // episode number
-    var name: String
-    var overview: String?
-    var image: URL?
-    var rating: Double?
-    var runtime: Int?
-}
-
 struct DetailView: View {
     let item: MetaPreview
+
+    /// `startSeason`/`startEpisode`: open with that episode selected (Continue Watching).
+    init(item: MetaPreview, startSeason: Int? = nil, startEpisode: Int? = nil) {
+        self.item = item
+        _season = State(initialValue: startSeason ?? 1)
+        _episode = State(initialValue: startEpisode ?? 1)
+    }
     @Environment(AddonStore.self) private var store
     @Environment(SimklStore.self) private var simkl
     @Environment(PinnedSources.self) private var pins
@@ -31,6 +29,7 @@ struct DetailView: View {
     @State private var loadingStreams = false
     @State private var showSources = false
     @State private var playRequest: PlayRequest?
+    @State private var pendingPlay: PlayRequest?
     @State private var season = 1
     @State private var episode = 1
     @State private var episodes: [EpisodeItem] = []
@@ -98,7 +97,12 @@ struct DetailView: View {
         }
         .ignoresSafeArea(edges: .top)
         .toolbarTitleDisplayMode(.inline)
-        .sheet(isPresented: $showSources) { sourceSheet }
+        .sheet(isPresented: $showSources, onDismiss: startPendingPlayback) { sourceSheet }
+        // Presented from the page itself (not from inside the sources sheet): the sheet closes first,
+        // then the player opens. This keeps dismissing the player reliable.
+        .fullScreenCover(item: $playRequest) { r in
+            PlayerScreen(request: r, provider: makeProvider(), onClose: { playRequest = nil })
+        }
         .task {
             // Native metadata + suggestions (no-ops without a TMDB key).
             async let d = try? TMDBClient.shared.details(for: item.id, type: item.type)
@@ -245,18 +249,23 @@ struct DetailView: View {
 
     private var episodeCarousel: some View {
         VStack(alignment: .leading, spacing: 10) {
-            ScrollView(.horizontal) {
-                LazyHStack(spacing: 12) {
-                    if loadingEpisodes && episodes.isEmpty {
-                        ProgressView().frame(width: 280, height: 158)
+            ScrollViewReader { proxy in
+                ScrollView(.horizontal) {
+                    LazyHStack(spacing: 12) {
+                        if loadingEpisodes && episodes.isEmpty {
+                            ProgressView().frame(width: 280, height: 158)
+                        }
+                        ForEach(episodes) { episodeCard($0).id($0.id) }
                     }
-                    ForEach(episodes) { episodeCard($0) }
+                    .scrollTargetLayout()
                 }
-                .scrollTargetLayout()
+                .contentMargins(.horizontal, 20, for: .scrollContent)
+                .scrollTargetBehavior(.viewAligned)
+                .scrollIndicators(.hidden)
+                .onChange(of: episodes.count) { _, _ in
+                    if episode > 1 { proxy.scrollTo(episode, anchor: .center) }
+                }
             }
-            .contentMargins(.horizontal, 20, for: .scrollContent)
-            .scrollTargetBehavior(.viewAligned)
-            .scrollIndicators(.hidden)
             // No TMDB/TVDB data: keep a manual way to pick the episode.
             if episodes.isEmpty && !loadingEpisodes {
                 Stepper("Episode \(episode)", value: $episode, in: 1...99).padding(.horizontal, 20)
@@ -302,28 +311,10 @@ struct DetailView: View {
         .buttonStyle(.plain)
     }
 
-    /// TMDB first (stills, overviews, ratings); TVDB fills missing thumbnails or stands in when TMDB has nothing.
     private func loadEpisodes() async {
         guard isSeries else { return }
         loadingEpisodes = true
-        var list = await TMDBClient.shared.episodes(for: item.id, type: item.type, season: season).map {
-            EpisodeItem(id: $0.episodeNumber, name: $0.name ?? "Episode \($0.episodeNumber)", overview: $0.overview,
-                        image: $0.stillURL, rating: $0.voteAverage, runtime: $0.runtime)
-        }
-        let needsArt = list.contains(where: { $0.image == nil })
-        if (list.isEmpty || needsArt), TVDBClient.shared.hasKey, let imdb = await ensureIMDB() {
-            let tv = await TVDBClient.shared.episodes(imdb: imdb, season: season)
-            if list.isEmpty {
-                list = tv.compactMap { e in
-                    e.number.map { EpisodeItem(id: $0, name: e.name ?? "Episode \($0)", overview: e.overview,
-                                               image: e.imageURL, rating: nil, runtime: e.runtime) }
-                }
-            } else {
-                for i in list.indices where list[i].image == nil {
-                    list[i].image = tv.first(where: { $0.number == list[i].id })?.imageURL
-                }
-            }
-        }
+        let list = await EpisodeLoader.load(itemID: item.id, type: item.type, season: season) { await ensureIMDB() }
         guard !Task.isCancelled else { return }
         episodes = list
         loadingEpisodes = false
@@ -395,12 +386,7 @@ struct DetailView: View {
         return imdbID
     }
 
-    private func stremioID() async -> String? {
-        if item.id.hasPrefix("tmdb:"), let n = Int(item.id.dropFirst(5)) {
-            return await TMDBClient.shared.imdbID(tmdb: n, type: item.type)
-        }
-        return item.id
-    }
+    private func stremioID() async -> String? { await SourceResolver.stremioID(for: item) }
 
     // MARK: Sources + pinning
 
@@ -413,17 +399,45 @@ struct DetailView: View {
         return (group.0, s)
     }
 
-    private func play(_ s: StreamItem) {
+    private func play(_ addon: Addon, _ s: StreamItem) {
         guard let u = s.url.flatMap(URL.init(string:)), let imdb = imdbID else { return }
-        playRequest = PlayRequest(url: u, headers: s.requestHeaders, item: item,
+        let ep = isSeries ? episodes.first(where: { $0.id == episode }) : nil
+        pendingPlay = PlayRequest(url: u, headers: s.requestHeaders, item: item,
                                   key: isSeries ? "\(season):\(episode)" : "movie", imdb: imdb,
                                   season: isSeries ? season : nil, episode: isSeries ? episode : nil,
-                                  episodeTitle: isSeries ? episodes.first(where: { $0.id == episode })?.name : nil,
-                                  logo: logoURL)
+                                  episodeTitle: ep?.name, logo: logoURL,
+                                  thumb: ep?.image ?? item.backdropURL,
+                                  sourceAddonID: addon.id, sourceSignature: s.signature)
+        showSources = false
+    }
+
+    /// Runs once the sources sheet has fully closed.
+    private func startPendingPlayback() {
+        guard let p = pendingPlay else { return }
+        pendingPlay = nil
+        Task {
+            try? await Task.sleep(for: .milliseconds(80))
+            playRequest = p
+        }
+    }
+
+    /// Lets the player browse episodes and jump to another one using the same add-ons and pins.
+    private func makeProvider() -> EpisodeProvider? {
+        guard isSeries else { return nil }
+        let item = item, addons = store.addons, pins = pins
+        let options = seasonChips.map { SeasonOption(id: $0.id, title: $0.title) }
+        return EpisodeProvider(
+            seasons: options,
+            episodes: { s in
+                await EpisodeLoader.load(itemID: item.id, type: item.type, season: s) { await SourceResolver.stremioID(for: item) }
+            },
+            resolve: { s, ep, current in
+                await SourceResolver.request(season: s, episode: ep, current: current, addons: addons, pins: pins)
+            })
     }
 
     private func row(_ addon: Addon, _ s: StreamItem, isPinned: Bool) -> some View {
-        Button { play(s) } label: {
+        Button { play(addon, s) } label: {
             HStack {
                 VStack(alignment: .leading) {
                     Text(s.name ?? s.title ?? "Stream").font(.headline)
@@ -467,7 +481,6 @@ struct DetailView: View {
             }
             .navigationTitle("Sources")
             .navigationBarTitleDisplayMode(.inline)
-            .fullScreenCover(item: $playRequest) { PlayerScreen(request: $0) }
         }
         .presentationDetents([.medium, .large])
     }

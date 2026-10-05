@@ -119,3 +119,39 @@ struct RatingBadge: View {
         .accessibilityLabel("\(rating.label) \(rating.text)")
     }
 }
+
+/// Brand logo + score, for use over artwork (Home hero).
+struct RatingPill: View {
+    let rating: MDBListClient.Rating
+
+    var body: some View {
+        HStack(spacing: 6) {
+            RatingLogo(label: rating.label, score: rating.score, height: 16)
+            Text(rating.text).font(.subheadline.weight(.bold)).monospacedDigit()
+        }
+        .foregroundStyle(.white)
+        .padding(.horizontal, 10).padding(.vertical, 6)
+        .background(.black.opacity(0.4), in: Capsule())
+        .overlay(Capsule().strokeBorder(.white.opacity(0.12), lineWidth: 0.5))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(rating.label) \(rating.text)")
+    }
+}
+
+/// Small star + score pinned to a poster corner.
+struct RatingChip: View {
+    let item: MetaPreview
+
+    var body: some View {
+        if let r = item.rating {
+            HStack(spacing: 3) {
+                Image(systemName: "star.fill").font(.system(size: 9, weight: .bold)).foregroundStyle(.yellow)
+                Text(String(format: "%.1f", r)).font(.system(size: 11, weight: .bold)).monospacedDigit()
+            }
+            .foregroundStyle(.white)
+            .padding(.horizontal, 6).padding(.vertical, 3)
+            .background(.black.opacity(0.62), in: Capsule())
+            .accessibilityLabel("Rating \(String(format: "%.1f", r))")
+        }
+    }
+}

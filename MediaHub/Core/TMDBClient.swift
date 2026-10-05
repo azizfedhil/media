@@ -20,7 +20,7 @@ actor TMDBClient {
 
     struct Item: Decodable { let id: Int; let title: String?; let name: String?; let overview: String?
         let posterPath: String?; let backdropPath: String?; let releaseDate: String?; let firstAirDate: String?
-        let mediaType: String? }
+        let mediaType: String?; let voteAverage: Double? }
     private struct Page: Decodable { let results: [Item] }
     private struct Find: Decodable { let movieResults: [Item]; let tvResults: [Item] }
     private struct External: Decodable { let imdbId: String? }
@@ -85,7 +85,8 @@ actor TMDBClient {
         MetaPreview(id: "tmdb:\(i.id)", type: kind == "tv" ? "series" : "movie",
             name: i.title ?? i.name ?? "Untitled",
             poster: i.posterPath.map { Self.img + "w342" + $0 }, background: i.backdropPath.map { Self.img + "w780" + $0 },
-            logo: nil, description: i.overview, releaseInfo: (i.releaseDate ?? i.firstAirDate).map { String($0.prefix(4)) })
+            logo: nil, description: i.overview, releaseInfo: (i.releaseDate ?? i.firstAirDate).map { String($0.prefix(4)) },
+            rating: (i.voteAverage ?? 0) > 0 ? i.voteAverage : nil)
     }
 
     func trending(_ kind: String, page: Int = 1) async throws -> [MetaPreview] {

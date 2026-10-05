@@ -127,6 +127,8 @@ struct SubCue: Equatable {
 struct SubtitleOverlay: View {
     let cues: [SubCue]
     let lift: CGFloat
+    /// User-chosen text size multiplier (1 = default).
+    var scale: CGFloat = 1
 
     var body: some View {
         GeometryReader { geo in
@@ -141,7 +143,7 @@ struct SubtitleOverlay: View {
                     VStack {
                         Spacer(minLength: 0)
                         Text(lines)
-                            .font(.system(size: size.width > 700 ? 30 : 21, weight: .semibold))
+                            .font(.system(size: (size.width > 700 ? 30 : 21) * scale, weight: .semibold))
                             .multilineTextAlignment(.center)
                             .foregroundStyle(.white)
                             .shadow(color: .black, radius: 1.5).shadow(color: .black, radius: 3)
@@ -165,7 +167,7 @@ struct SubtitleOverlay: View {
                     .position(x: video.minX + r.midX * video.width, y: video.minY + r.midY * video.height)
             } else {
                 pic.scaledToFit()
-                    .frame(maxWidth: size.width * 0.9, maxHeight: size.height * 0.3)
+                    .frame(maxWidth: size.width * 0.9, maxHeight: size.height * 0.3 * min(scale, 1.5))
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                     .padding(.bottom, 40 + lift)
             }
