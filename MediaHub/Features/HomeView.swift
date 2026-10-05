@@ -147,6 +147,8 @@ struct HomeView: View {
                 .background(alignment: .top) { ambient }
             }
             .ignoresSafeArea(edges: .top)
+            .navigationBarTitleDisplayMode(.inline)
+            .profileToolbar()
             .scrollIndicators(.hidden)
             .refreshable { await refresh() }
             .overlay { if model.rows.isEmpty && model.suggested.isEmpty { ProgressView() } }
