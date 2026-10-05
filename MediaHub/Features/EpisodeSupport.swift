@@ -7,6 +7,12 @@ struct EpisodeItem: Identifiable {
     var image: URL?
     var rating: Double?
     var runtime: Int?
+    var airDate: String?        // yyyy-MM-dd, when known
+}
+
+struct NextEpisode {
+    let season: Int
+    let episode: EpisodeItem
 }
 
 struct SeasonOption: Identifiable, Hashable {
@@ -21,6 +27,8 @@ struct EpisodeProvider {
     var episodes: @MainActor (Int) async -> [EpisodeItem]
     /// Finds a playable source for the episode and returns a ready-to-play request, or nil if none exists.
     var resolve: @MainActor (Int, EpisodeItem, PlayRequest) async -> PlayRequest?
+    /// The episode after the one in `PlayRequest`, if there is one that has aired.
+    var next: @MainActor (PlayRequest) async -> NextEpisode?
 }
 
 enum EpisodeLoader {
@@ -29,7 +37,7 @@ enum EpisodeLoader {
                      imdb resolveIMDB: () async -> String?) async -> [EpisodeItem] {
         var list = await TMDBClient.shared.episodes(for: itemID, type: type, season: season).map {
             EpisodeItem(id: $0.episodeNumber, name: $0.name ?? "Episode \($0.episodeNumber)", overview: $0.overview,
-                        image: $0.stillURL, rating: $0.voteAverage, runtime: $0.runtime)
+                        image: $0.stillURL, rating: $0.voteAverage, runtime: $0.runtime, airDate: $0.airDate)
         }
         let needsArt = list.contains(where: { $0.image == nil })
         if (list.isEmpty || needsArt), TVDBClient.shared.hasKey, let imdb = await resolveIMDB() {
@@ -58,8 +66,8 @@ enum SourceResolver {
         return item.id
     }
 
-    /// Picks the stream for another episode, preferring (1) the pinned source, (2) the add-on and
-    /// release name that is playing now, (3) the first playable stream from any add-on.
+    /// Picks the stream for another episode, preferring (1) the add-on and release name that is playing now,
+    /// (2) the pinned source, (3) the first playable stream from any add-on.
     @MainActor
     static func request(season: Int, episode: EpisodeItem, current: PlayRequest,
                         addons: [Addon], pins: PinnedSources) async -> PlayRequest? {
@@ -75,9 +83,10 @@ enum SourceResolver {
             return (g.0, s)
         }
 
+        // The source you are watching now wins (so "next episode" keeps your quality / provider), then the pin.
         var chosen: (Addon, StreamItem)?
-        if let pin = pins.pin(for: current.imdb) { chosen = match(pin.addonID, pin.signature) }
-        if chosen == nil, let a = current.sourceAddonID { chosen = match(a, current.sourceSignature) }
+        if let a = current.sourceAddonID { chosen = match(a, current.sourceSignature) }
+        if chosen == nil, let pin = pins.pin(for: current.imdb) { chosen = match(pin.addonID, pin.signature) }
         if chosen == nil {
             for g in ordered { if let s = g.1.first(where: \.isPlayable) { chosen = (g.0, s); break } }
         }

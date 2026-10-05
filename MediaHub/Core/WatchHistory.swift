@@ -19,6 +19,8 @@ final class WatchHistory {
         var id: String { item.id }
 
         var progress: Double { duration > 0 ? min(max(position / duration, 0), 1) : 0 }
+        /// Watched far enough that the next episode is the natural thing to offer.
+        var isFinished: Bool { duration > 0 && position >= duration * 0.92 }
         /// Season/episode, from the stored fields or (older entries) parsed from the "2:5" key.
         var seasonEpisode: (season: Int, episode: Int)? {
             if let s = season, let e = episode { return (s, e) }
@@ -36,7 +38,11 @@ final class WatchHistory {
 
     var lastWatched: MetaPreview? { entries.first?.item }
     var continueEntries: [Entry] {
-        entries.filter { $0.position > 30 && $0.position < $0.duration * 0.95 }
+        entries.filter { $0.position > 30 && !$0.isFinished }
+    }
+    /// Shows whose last episode is done: candidates for "Up Next".
+    var finishedSeries: [Entry] {
+        entries.filter { $0.isFinished && $0.item.type == "series" && $0.seasonEpisode != nil }
     }
     var continueWatching: [MetaPreview] { continueEntries.map(\.item) }
     func entry(for id: String) -> Entry? { entries.first { $0.id == id } }

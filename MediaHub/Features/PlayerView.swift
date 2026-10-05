@@ -20,8 +20,8 @@ struct PlayRequest: Identifiable {
     var sourceSignature: String? = nil
 }
 
-/// Playback position lives in its own object: only the seek bar observes it, so the 4 Hz clock
-/// never re-renders the rest of the player.
+/// Playback position lives in its own object: only views that read it (seek bar, skip button) redraw on the
+/// clock, never the whole player.
 @MainActor @Observable
 final class Playhead {
     var position: Double = 0
@@ -38,6 +38,7 @@ final class PlayerModel {
     var isBuffering = true
     /// Debounced `isBuffering`: short stalls don't flash a spinner.
     var showSpinner = true
+    var didEnd = false
     var error: String?
     var audioTracks: [TrackInfo] = []
     var subtitleTracks: [TrackInfo] = []
@@ -60,6 +61,11 @@ final class PlayerModel {
     @ObservationIgnored private var isShutDown = false
     @ObservationIgnored private var preferredSubtitleLanguage: String?
     @ObservationIgnored private var autoSelectSubtitle = false
+
+    /// The viewer's default subtitle language (nil = off). Applied when tracks become available.
+    func configure(defaultSubtitleLanguage lang: String?) {
+        if preferredSubtitleLanguage == nil { preferredSubtitleLanguage = lang }
+    }
 
     /// `replacing`: the engine is already playing something else (episode switch).
     func start(_ r: PlayRequest, resume: Double?, replacing: Bool = false) async {
@@ -89,14 +95,14 @@ final class PlayerModel {
     }
 
     private func resetForNewItem() {
-        error = nil
+        error = nil; didEnd = false
         isPlaying = false; isPaused = false
         setBuffering(true); showSpinner = true
         playhead.position = 0; playhead.duration = 0
         seekTask?.cancel(); pendingTarget = nil; seekInFlight = false
         allCues = []; mappedCount = 0; mappedFirst = nil; activeCues = []
         activeSubtitleID = nil; subtitleTracks = []; audioTracks = []; activeAudioID = nil
-        // Keep the viewer's subtitle language across episodes.
+        // Default language on first start, then whatever the viewer picked, across episodes.
         autoSelectSubtitle = preferredSubtitleLanguage != nil
     }
 
@@ -108,7 +114,7 @@ final class PlayerModel {
             case .playing: isPlaying = true; isPaused = false; setBuffering(false); error = nil; refreshTracks()
             case .paused: isPlaying = false; isPaused = true; setBuffering(false)
             case .loading, .seeking: isPaused = false; setBuffering(true)
-            case .ended: isPlaying = false; isPaused = false; setBuffering(false)
+            case .ended: isPlaying = false; isPaused = false; setBuffering(false); didEnd = true
             case .error: isPlaying = false; isPaused = false; setBuffering(false); error = "Playback failed (\(String(describing: s)))."
             default: break
             }
@@ -182,13 +188,21 @@ final class PlayerModel {
         activeSubtitleID = Reflect.int(engine.activeSubtitleTrackIndex)
         if autoSelectSubtitle, !subtitleTracks.isEmpty {
             autoSelectSubtitle = false
-            if activeSubtitleID == nil, let lang = preferredSubtitleLanguage,
-               let t = subtitleTracks.first(where: { Reflect.string($0, "language") == lang && !Reflect.bool($0, "isForced") }) {
+            if activeSubtitleID == nil, let lang = preferredSubtitleLanguage, let t = bestSubtitle(for: lang) {
                 selectSubtitle(t)
                 return
             }
         }
         refreshActiveCues()
+    }
+
+    /// Prefers a normal track, then a non-forced one, then anything in that language.
+    private func bestSubtitle(for lang: String) -> TrackInfo? {
+        let hits = subtitleTracks.filter {
+            SubLanguages.matches(Reflect.string($0, "language"), lang) || SubLanguages.matches(Reflect.string($0, "name"), lang)
+        }
+        return hits.first { !Reflect.bool($0, "isForced") && !Reflect.bool($0, "isHearingImpaired") }
+            ?? hits.first { !Reflect.bool($0, "isForced") } ?? hits.first
     }
 
     func selectSubtitle(_ t: TrackInfo?) {
@@ -197,7 +211,7 @@ final class PlayerModel {
         if let t {
             engine.selectSubtitleTrack(index: t.id)
             activeSubtitleID = Reflect.int(t.id)
-            preferredSubtitleLanguage = Reflect.string(t, "language")
+            preferredSubtitleLanguage = Reflect.string(t, "language") ?? Reflect.string(t, "name")
             ingest(engine.subtitleCues)
         } else {
             engine.clearSubtitle()
@@ -221,7 +235,7 @@ final class PlayerModel {
         min(max(t, 0), playhead.duration > 0 ? playhead.duration : max(t, 0))
     }
 
-    /// Seek immediately (scrub release).
+    /// Seek immediately (scrub release, skip-intro button).
     func seek(to t: Double) async {
         seekTask?.cancel()
         pendingTarget = clamp(t)
@@ -260,38 +274,66 @@ final class PlayerModel {
     }
 }
 
-// MARK: - Player screen
+// MARK: - Glass helpers
 
-private struct SubtitleSize: Identifiable {
-    let name: String
-    let value: Double
-    var id: Double { value }
+/// Liquid Glass when enabled, flat translucent fill otherwise (Settings → Playback).
+private struct GlassCircle: ViewModifier {
+    let on: Bool
+    var tint: Color? = nil
+    @ViewBuilder func body(content: Content) -> some View {
+        if on {
+            if let tint { content.glassEffect(.regular.tint(tint.opacity(0.55)), in: .circle) }
+            else { content.glassEffect(.regular, in: .circle) }
+        } else {
+            content.background(tint?.opacity(0.75) ?? Color.black.opacity(0.4), in: Circle())
+        }
+    }
 }
 
-/// Fullscreen player. Controls are flat translucent shapes (not Liquid Glass): glass over live video
-/// re-samples every frame, which costs GPU time and made taps unreliable.
+private struct GlassCapsule: ViewModifier {
+    let on: Bool
+    @ViewBuilder func body(content: Content) -> some View {
+        if on { content.glassEffect(.regular, in: .capsule) }
+        else { content.background(.black.opacity(0.55), in: Capsule()) }
+    }
+}
+
+private struct GlassCard: ViewModifier {
+    let on: Bool
+    var radius: CGFloat = 26
+    @ViewBuilder func body(content: Content) -> some View {
+        if on { content.glassEffect(.regular, in: .rect(cornerRadius: radius)) }
+        else { content.background(.black.opacity(0.88), in: RoundedRectangle(cornerRadius: radius, style: .continuous)) }
+    }
+}
+
+// MARK: - Player screen
+
 struct PlayerScreen: View {
     let provider: EpisodeProvider?
     let onClose: () -> Void
     @Environment(WatchHistory.self) private var history
     @Environment(SimklStore.self) private var simkl
+    @Environment(ThemeStore.self) private var theme
     @Environment(\.openURL) private var openURL
-    @AppStorage("player.subScale") private var subScale = 1.0
+    @AppStorage(SubtitleStyle.storageKey) private var subJSON = ""
+    @AppStorage("sub.lang") private var subLang = "off"
+    @AppStorage("player.glass") private var glass = true
+    @AppStorage("player.autoplayNext") private var autoplayNext = true
+    @AppStorage("skip.fallbackSeconds") private var fallbackSkip = 85
     @State private var current: PlayRequest
     @State private var model = PlayerModel()
     @State private var showControls = true
     @State private var showEpisodes = false
+    @State private var showSubtitles = false
     @State private var hideTask: Task<Void, Never>?
     @State private var scrobbled = false
     @State private var closing = false
     @State private var switching: Int?
     @State private var notice: String?
-
-    private static let sizes = [
-        SubtitleSize(name: "Small", value: 0.8), SubtitleSize(name: "Medium", value: 1.0),
-        SubtitleSize(name: "Large", value: 1.3), SubtitleSize(name: "Extra large", value: 1.65),
-        SubtitleSize(name: "Huge", value: 2.1),
-    ]
+    @State private var nextEp: NextEpisode?
+    @State private var segments: [SkipSegment] = []
+    @State private var segmentsLoaded = false
 
     init(request: PlayRequest, provider: EpisodeProvider? = nil, onClose: @escaping () -> Void) {
         _current = State(initialValue: request)
@@ -303,15 +345,17 @@ struct PlayerScreen: View {
         ZStack {
             Color.black.ignoresSafeArea()
             if let engine = model.engine { AetherPlayerSurface(engine: engine).ignoresSafeArea() }
-            SubtitleOverlay(cues: model.activeCues, lift: showControls ? 84 : 0, scale: CGFloat(subScale))
+            SubtitleOverlay(cues: model.activeCues, lift: showControls ? 118 : 0, style: SubtitleStyle.decode(subJSON))
                 .animation(.easeInOut(duration: 0.2), value: showControls)
             Color.clear.contentShape(Rectangle()).onTapGesture { tapBackground() }
-            if model.isPaused && model.error == nil && !showEpisodes { pausedOverlay }
+            if model.isPaused && model.error == nil && !showEpisodes && !showSubtitles { pausedOverlay }
             if model.showSpinner && model.error == nil && !showControls && !showEpisodes {
                 ProgressView().controlSize(.large).tint(.white)
             }
             if showControls || model.error != nil { controls.transition(.opacity) }
+            if !showEpisodes && !showSubtitles && model.error == nil { skipLayer }
             if showEpisodes, let provider { episodePanel(provider).transition(.move(edge: .bottom).combined(with: .opacity)) }
+            if showSubtitles { subtitlePanel.transition(.move(edge: .trailing).combined(with: .opacity)) }
             if let e = model.error { errorCard(e) }
             if let n = notice { toast(n) }
         }
@@ -320,6 +364,7 @@ struct PlayerScreen: View {
         .persistentSystemOverlays(showControls ? .automatic : .hidden)
         .animation(.snappy(duration: 0.25), value: notice)
         .task { await begin() }
+        .task(id: current.id) { await loadAux() }
         .task {
             // Coarse 10 s tick: negligible wakeups, still good resume accuracy.
             while !Task.isCancelled {
@@ -334,6 +379,9 @@ struct PlayerScreen: View {
         .onChange(of: model.isPaused) { _, paused in
             if paused { withAnimation(.easeInOut(duration: 0.2)) { showControls = true } }
         }
+        .onChange(of: model.didEnd) { _, ended in
+            if ended, autoplayNext, nextEp != nil { playNext() }
+        }
         .onAppear { UIApplication.shared.isIdleTimerDisabled = true }
         .onDisappear {
             UIApplication.shared.isIdleTimerDisabled = false
@@ -347,14 +395,14 @@ struct PlayerScreen: View {
     private var controls: some View {
         ZStack {
             VStack(spacing: 0) {
-                LinearGradient(colors: [.black.opacity(0.55), .clear], startPoint: .top, endPoint: .bottom).frame(height: 110)
+                LinearGradient(colors: [.black.opacity(0.5), .clear], startPoint: .top, endPoint: .bottom).frame(height: 100)
                 Spacer()
-                LinearGradient(colors: [.clear, .black.opacity(0.78)], startPoint: .top, endPoint: .bottom).frame(height: 200)
+                LinearGradient(colors: [.clear, .black.opacity(0.78)], startPoint: .top, endPoint: .bottom).frame(height: 230)
             }
             .ignoresSafeArea().allowsHitTesting(false)
 
             VStack(spacing: 0) {
-                topBar
+                HStack { circleButton("xmark", size: 42, icon: 16) { close() }; Spacer() }
                 Spacer()
                 transport
                 Spacer()
@@ -365,28 +413,20 @@ struct PlayerScreen: View {
         .foregroundStyle(.white)
     }
 
-    private var topBar: some View {
-        HStack(spacing: 4) {
-            iconButton("xmark") { close() }
-            Spacer()
-            if !model.subtitleTracks.isEmpty { subtitleMenu }
-            if model.audioTracks.count > 1 { audioMenu }
-        }
-    }
-
     private var transport: some View {
-        HStack(spacing: 52) {
-            transportButton("gobackward.10", size: 28) { model.skip(by: -10); scheduleHide() }
+        HStack(spacing: 38) {
+            circleButton("gobackward.10", size: 50, icon: 21) { model.skip(by: -10); scheduleHide() }
             ZStack {
-                transportButton(model.isPlaying ? "pause.fill" : "play.fill", size: 44) { model.togglePlay(); scheduleHide() }
-                    .opacity(model.showSpinner ? 0.25 : 1)
+                circleButton(model.isPlaying ? "pause.fill" : "play.fill", size: 68, icon: 28) { model.togglePlay(); scheduleHide() }
+                    .opacity(model.showSpinner ? 0.3 : 1)
                 if model.showSpinner { ProgressView().controlSize(.large).tint(.white).allowsHitTesting(false) }
             }
-            transportButton("goforward.10", size: 28) { model.skip(by: 10); scheduleHide() }
+            circleButton("goforward.10", size: 50, icon: 21) { model.skip(by: 10); scheduleHide() }
         }
     }
 
-    /// Series name + episode directly above the seek bar. Tapping the name opens the episode carousel.
+    /// Series name + episode directly above the seek bar (tap the name for episodes), then the seek bar,
+    /// then the icon row: subtitles, audio, next episode.
     private var bottomBar: some View {
         VStack(alignment: .leading, spacing: 8) {
             Button { openEpisodes() } label: {
@@ -408,7 +448,37 @@ struct PlayerScreen: View {
             SeekBar(playhead: model.playhead,
                     onScrubStart: { hideTask?.cancel() },
                     onCommit: { t in Task { await model.seek(to: t); scheduleHide() } })
+
+            iconRow
         }
+    }
+
+    private var iconRow: some View {
+        HStack(spacing: 10) {
+            if !model.subtitleTracks.isEmpty {
+                circleButton(model.activeSubtitleID == nil ? "captions.bubble" : "captions.bubble.fill",
+                             size: 42, icon: 17, tint: showSubtitles ? theme.accent : nil) { toggleSubtitles() }
+            }
+            if model.audioTracks.count > 1 { audioMenu }
+            Spacer()
+            if nextEp != nil { nextButton }
+        }
+    }
+
+    private var nextButton: some View {
+        Button { playNext() } label: {
+            HStack(spacing: 7) {
+                if switching != nil { ProgressView().tint(.white).controlSize(.small) }
+                else { Image(systemName: "forward.end.fill").font(.system(size: 13, weight: .bold)) }
+                Text("Next").font(.system(size: 14, weight: .semibold))
+            }
+            .foregroundStyle(.white)
+            .padding(.horizontal, 16).frame(height: 42)
+            .modifier(GlassCapsule(on: glass))
+            .contentShape(Capsule())
+        }
+        .buttonStyle(PressableStyle())
+        .disabled(switching != nil)
     }
 
     /// "S1 · E3 · Episode title", or the movie's year.
@@ -421,61 +491,21 @@ struct PlayerScreen: View {
         return current.item.releaseInfo
     }
 
-    // MARK: Buttons + menus
+    // MARK: Buttons
 
-    private func iconButton(_ symbol: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) { glyph(symbol) }
-            .buttonStyle(PressableStyle())
-    }
-
-    private func glyph(_ symbol: String) -> some View {
-        Image(systemName: symbol)
-            .font(.system(size: 15, weight: .semibold))
-            .foregroundStyle(.white)
-            .frame(width: 36, height: 36)
-            .background(.black.opacity(0.38), in: Circle())
-            .padding(4)                      // 44 pt touch target
-            .contentShape(Rectangle())
-    }
-
-    private func transportButton(_ symbol: String, size: CGFloat, action: @escaping () -> Void) -> some View {
+    private func circleButton(_ symbol: String, size: CGFloat, icon: CGFloat, tint: Color? = nil,
+                              action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: symbol)
-                .font(.system(size: size, weight: .semibold))
+                .font(.system(size: icon, weight: .semibold))
                 .foregroundStyle(.white)
-                .shadow(color: .black.opacity(0.45), radius: 6)
                 .contentTransition(.symbolEffect(.replace))
                 .animation(.snappy(duration: 0.2), value: symbol)
-                .frame(width: 64, height: 64)
-                .contentShape(Rectangle())
+                .frame(width: size, height: size)
+                .modifier(GlassCircle(on: glass, tint: tint))
+                .contentShape(Circle())
         }
         .buttonStyle(PressableStyle())
-    }
-
-    @ViewBuilder private func checkLabel(_ title: String, _ on: Bool) -> some View {
-        if on { Label(title, systemImage: "checkmark") } else { Text(title) }
-    }
-
-    private var subtitleMenu: some View {
-        Menu {
-            Button { model.selectSubtitle(nil) } label: { checkLabel("Off", model.activeSubtitleID == nil) }
-            ForEach(model.subtitleTracks, id: \.id) { t in
-                Button { model.selectSubtitle(t) } label: {
-                    checkLabel(Reflect.trackTitle(t), Reflect.int(t.id) == model.activeSubtitleID)
-                }
-            }
-            Divider()
-            Menu {
-                Picker("Subtitle size", selection: $subScale) {
-                    ForEach(Self.sizes) { Text($0.name).tag($0.value) }
-                }
-                .pickerStyle(.inline)
-            } label: { Label("Subtitle size", systemImage: "textformat.size") }
-        } label: {
-            glyph(model.activeSubtitleID == nil ? "captions.bubble" : "captions.bubble.fill")
-        }
-        .menuIndicator(.hidden)
-        .tint(.white)
     }
 
     private var audioMenu: some View {
@@ -485,9 +515,111 @@ struct PlayerScreen: View {
                     checkLabel(Reflect.trackTitle(t), Reflect.int(t.id) == model.activeAudioID)
                 }
             }
-        } label: { glyph("speaker.wave.2") }
+        } label: {
+            Image(systemName: "speaker.wave.2").font(.system(size: 17, weight: .semibold)).foregroundStyle(.white)
+                .frame(width: 42, height: 42).modifier(GlassCircle(on: glass)).contentShape(Circle())
+        }
         .menuIndicator(.hidden)
         .tint(.white)
+    }
+
+    @ViewBuilder private func checkLabel(_ title: String, _ on: Bool) -> some View {
+        if on { Label(title, systemImage: "checkmark") } else { Text(title) }
+    }
+
+    // MARK: Skip intro / next episode
+
+    private var skipLayer: some View {
+        VStack {
+            Spacer()
+            HStack {
+                Spacer()
+                SkipOverlay(playhead: model.playhead, segments: segments, loaded: segmentsLoaded, hasNext: nextEp != nil,
+                            fallback: (current.season != nil && fallbackSkip > 0 && showControls) ? Double(fallbackSkip) : nil,
+                            glass: glass,
+                            onSeek: { t in Task { await model.seek(to: t); scheduleHide() } },
+                            onNext: { playNext() })
+            }
+            .padding(.trailing, 28)
+            .padding(.bottom, showControls ? 140 : 40)
+        }
+        .animation(.snappy(duration: 0.25), value: showControls)
+    }
+
+    /// Timestamps from TheIntroDB, and which episode comes next. Both run again whenever the episode changes.
+    private func loadAux() async {
+        nextEp = nil; segments = []; segmentsLoaded = false
+        let req = current
+        async let found = IntroClient.shared.segments(item: req.item, imdb: req.imdb, season: req.season, episode: req.episode)
+        if let provider, req.season != nil { nextEp = await provider.next(req) }
+        let segs = await found
+        guard !Task.isCancelled else { return }
+        segments = segs; segmentsLoaded = true
+    }
+
+    private func playNext() {
+        guard let n = nextEp else { return }
+        switchEpisode(n.season, n.episode)
+    }
+
+    // MARK: Subtitle panel
+
+    private var subtitlePanel: some View {
+        HStack(spacing: 0) {
+            Spacer(minLength: 0)
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    Text("Subtitles").font(.headline)
+                    Spacer()
+                    circleButton("xmark", size: 34, icon: 13) { closeSubtitles() }
+                }
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 20) {
+                        VStack(spacing: 6) {
+                            trackRow("Off", on: model.activeSubtitleID == nil) { model.selectSubtitle(nil) }
+                            ForEach(model.subtitleTracks, id: \.id) { t in
+                                trackRow(Reflect.trackTitle(t), on: Reflect.int(t.id) == model.activeSubtitleID) { model.selectSubtitle(t) }
+                            }
+                        }
+                        Text("APPEARANCE").font(.caption.weight(.bold)).tracking(1).foregroundStyle(.white.opacity(0.6))
+                        SubtitleStyleControls(showsPreview: false, onDark: true)
+                    }
+                    .padding(.bottom, 6)
+                }
+                .scrollIndicators(.hidden)
+            }
+            .foregroundStyle(.white)
+            .padding(18)
+            .frame(width: 340)
+            .modifier(GlassCard(on: glass))
+            .padding(.vertical, 10).padding(.trailing, 10)
+        }
+    }
+
+    private func trackRow(_ title: String, on: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack {
+                Text(title).font(.subheadline.weight(.medium)).lineLimit(1)
+                Spacer()
+                if on { Image(systemName: "checkmark").font(.footnote.weight(.bold)).foregroundStyle(theme.accent) }
+            }
+            .padding(.horizontal, 12).padding(.vertical, 10)
+            .background(Color.white.opacity(on ? 0.16 : 0.07), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func toggleSubtitles() {
+        hideTask?.cancel()
+        if showSubtitles { closeSubtitles(); return }
+        // Controls get out of the way so the subtitles can be judged where they will really appear.
+        withAnimation(.snappy(duration: 0.3)) { showSubtitles = true; showEpisodes = false; showControls = false }
+    }
+
+    private func closeSubtitles() {
+        withAnimation(.snappy(duration: 0.3)) { showSubtitles = false; showControls = true }
+        scheduleHide()
     }
 
     // MARK: Episode carousel
@@ -506,7 +638,7 @@ struct PlayerScreen: View {
     private func openEpisodes() {
         guard provider != nil else { return }
         hideTask?.cancel()
-        withAnimation(.snappy(duration: 0.3)) { showEpisodes = true; showControls = false }
+        withAnimation(.snappy(duration: 0.3)) { showEpisodes = true; showSubtitles = false; showControls = false }
     }
 
     private func closeEpisodes() {
@@ -514,6 +646,8 @@ struct PlayerScreen: View {
         scheduleHide()
     }
 
+    /// Jumps to another episode. `resolve` keeps the source you are watching now (same add-on and release name),
+    /// then falls back to the pinned source, then to any playable stream.
     private func switchEpisode(_ s: Int, _ ep: EpisodeItem) {
         guard let provider, switching == nil else { return }
         if s == current.season, ep.id == current.episode { closeEpisodes(); return }
@@ -554,18 +688,12 @@ struct PlayerScreen: View {
 
     // MARK: Paused + error
 
-    /// Title art when paused: TVDB clear logo if we have it, else the add-on's logo, else Metahub's, else the name as text.
-    private var logoURL: URL? {
-        if let l = current.logo { return l }
-        if let l = current.item.logo.flatMap(URL.init(string:)) { return l }
-        return URL(string: "https://images.metahub.space/logo/medium/\(current.imdb)/img")
-    }
-
+    /// Title art when paused: the logo if we found one, otherwise the name as text.
     private var pausedOverlay: some View {
         ZStack(alignment: .top) {
             Color.black.opacity(0.4).ignoresSafeArea()
             VStack(spacing: 12) {
-                TitleLogo(url: logoURL, fallback: current.item.name).frame(maxWidth: 300, maxHeight: 90)
+                TitleArt(item: current.item, maxWidth: 300, maxHeight: 90, font: .largeTitle.bold(), alignment: .center)
                 if let l = subtitleLine { Text(l).font(.headline).foregroundStyle(.white.opacity(0.85)) }
             }
             .padding(.top, 70)
@@ -596,17 +724,19 @@ struct PlayerScreen: View {
     // MARK: Actions
 
     private func begin() async {
+        model.configure(defaultSubtitleLanguage: subLang == "off" ? nil : subLang)
         await model.start(current, resume: resumePoint(for: current))
         scheduleHide()
     }
 
     private func resumePoint(for r: PlayRequest) -> Double? {
-        if let e = history.entry(for: r.item.id), e.key == r.key, e.position > 30 { return e.position }
+        if let e = history.entry(for: r.item.id), e.key == r.key, e.position > 30, !e.isFinished { return e.position }
         return nil
     }
 
     private func tapBackground() {
         if showEpisodes { closeEpisodes(); return }
+        if showSubtitles { closeSubtitles(); return }
         withAnimation(.easeInOut(duration: 0.2)) { showControls.toggle() }
         if showControls { scheduleHide() }
     }
@@ -616,7 +746,7 @@ struct PlayerScreen: View {
         guard model.isPlaying else { return }
         hideTask = Task {
             try? await Task.sleep(for: .seconds(3.5))
-            guard !Task.isCancelled, !model.playhead.scrubbing, !showEpisodes else { return }
+            guard !Task.isCancelled, !model.playhead.scrubbing, !showEpisodes, !showSubtitles else { return }
             withAnimation(.easeInOut(duration: 0.25)) { showControls = false }
         }
     }
@@ -713,6 +843,55 @@ private struct SeekBar: View {
     }
 }
 
+// MARK: - Skip intro / next episode button
+
+/// One floating button that changes with the moment: Skip Intro / Recap / Preview during those segments,
+/// "Next Episode" in the credits or the last 45 s, and (when no timestamps exist) a manual skip while controls show.
+private struct SkipOverlay: View {
+    let playhead: Playhead
+    let segments: [SkipSegment]
+    let loaded: Bool
+    let hasNext: Bool
+    let fallback: Double?
+    let glass: Bool
+    let onSeek: (Double) -> Void
+    let onNext: () -> Void
+
+    private struct Choice { let title: String; let symbol: String; let target: Double? }   // nil target = next episode
+
+    private var choice: Choice? {
+        let p = playhead.position, d = playhead.duration
+        guard d > 0 else { return nil }
+        let seg = segments.first { p >= $0.start - 0.5 && p < ($0.end ?? d) - 1.5 }
+        if hasNext && ((d - p <= 45 && p > 60) || seg?.kind == .credits) {
+            return Choice(title: "Next Episode", symbol: "forward.end.fill", target: nil)
+        }
+        if let seg { return Choice(title: seg.label, symbol: "forward.fill", target: seg.end ?? d) }
+        if loaded, segments.isEmpty, let f = fallback, p >= 3, p <= 420 {
+            return Choice(title: "Skip \(Int(f))s", symbol: "goforward", target: p + f)
+        }
+        return nil
+    }
+
+    var body: some View {
+        let c = choice
+        ZStack {
+            if let c {
+                Button { if let t = c.target { onSeek(t) } else { onNext() } } label: {
+                    Label(c.title, systemImage: c.symbol)
+                        .font(.system(size: 15, weight: .semibold)).foregroundStyle(.white)
+                        .padding(.horizontal, 20).frame(height: 44)
+                        .modifier(GlassCapsule(on: glass))
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(PressableStyle())
+                .transition(.move(edge: .trailing).combined(with: .opacity))
+            }
+        }
+        .animation(.snappy(duration: 0.25), value: c?.title)
+    }
+}
+
 // MARK: - Episode panel
 
 /// Bottom sheet over the video: season pills + a carousel of episode thumbnails.
@@ -724,6 +903,7 @@ private struct EpisodePanel: View {
     let switching: Int?
     let onSelect: (Int, EpisodeItem) -> Void
     let onClose: () -> Void
+    @Environment(ThemeStore.self) private var theme
 
     @State private var season: Int
     @State private var episodes: [EpisodeItem] = []
@@ -784,7 +964,7 @@ private struct EpisodePanel: View {
                     Button { season = s.id } label: {
                         Text(s.title).font(.system(size: 13, weight: .semibold))
                             .padding(.horizontal, 14).padding(.vertical, 7)
-                            .background(s.id == season ? Theme.accent : Color.white.opacity(0.14), in: Capsule())
+                            .background(s.id == season ? theme.accent : Color.white.opacity(0.14), in: Capsule())
                     }
                     .buttonStyle(PressableStyle())
                 }
@@ -834,7 +1014,7 @@ private struct EpisodePanel: View {
                         if isCurrent {
                             Label("Playing", systemImage: "waveform").font(.system(size: 11, weight: .bold))
                                 .padding(.horizontal, 8).padding(.vertical, 4)
-                                .background(Theme.accent, in: Capsule()).padding(8)
+                                .background(theme.accent, in: Capsule()).padding(8)
                         }
                     }
                     .overlay {
@@ -845,7 +1025,7 @@ private struct EpisodePanel: View {
                     .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                     .overlay {
                         RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .strokeBorder(Theme.accent, lineWidth: isCurrent ? 2.5 : 0)
+                            .strokeBorder(theme.accent, lineWidth: isCurrent ? 2.5 : 0)
                     }
                 Text(ep.name).font(.system(size: 13, weight: .semibold)).lineLimit(1)
                     .frame(width: cardWidth, alignment: .leading)
@@ -855,28 +1035,5 @@ private struct EpisodePanel: View {
         }
         .buttonStyle(PressableStyle())
         .disabled(switching != nil)
-    }
-}
-
-/// Loads a title logo through the shared image pipeline; shows the title as text when there is no logo.
-private struct TitleLogo: View {
-    let url: URL?
-    let fallback: String
-    @State private var image: UIImage?
-    @State private var finished = false
-
-    var body: some View {
-        Group {
-            if let image {
-                Image(uiImage: image).resizable().scaledToFit().shadow(color: .black.opacity(0.5), radius: 8)
-            } else if finished {
-                Text(fallback).font(.largeTitle.bold()).multilineTextAlignment(.center).lineLimit(2).foregroundStyle(.white)
-            }
-        }
-        .task(id: url) {
-            finished = false; image = nil
-            if let url { image = await ImagePipeline.shared.image(for: url, maxPixel: 900) }
-            finished = true
-        }
     }
 }

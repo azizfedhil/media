@@ -9,16 +9,20 @@ private struct SeasonChip: Identifiable {
 
 struct DetailView: View {
     let item: MetaPreview
+    private let explicitStart: Bool
 
     /// `startSeason`/`startEpisode`: open with that episode selected (Continue Watching).
     init(item: MetaPreview, startSeason: Int? = nil, startEpisode: Int? = nil) {
         self.item = item
+        explicitStart = startSeason != nil
         _season = State(initialValue: startSeason ?? 1)
         _episode = State(initialValue: startEpisode ?? 1)
     }
     @Environment(AddonStore.self) private var store
     @Environment(SimklStore.self) private var simkl
     @Environment(PinnedSources.self) private var pins
+    @Environment(WatchHistory.self) private var history
+    @Environment(ThemeStore.self) private var theme
     @State private var imdbID: String?
     @State private var onWatchlist = false
     @State private var ratings: [MDBListClient.Rating] = []
@@ -29,6 +33,8 @@ struct DetailView: View {
     @State private var loadingStreams = false
     @State private var showSources = false
     @State private var playRequest: PlayRequest?
+    @State private var upNext: UpNextItem?
+    @State private var userPicked = false
     @State private var pendingPlay: PlayRequest?
     @State private var season = 1
     @State private var episode = 1
@@ -115,10 +121,8 @@ struct DetailView: View {
             imdbID = imdb
             ratings = await MDBListClient.shared.ratings(imdb: imdb, type: item.type)
         }
-        .task {
-            guard TVDBClient.shared.hasKey, let imdb = await ensureIMDB() else { return }
-            logoURL = await TVDBClient.shared.logo(imdb: imdb, type: item.type)
-        }
+        .task { logoURL = await LogoResolver.shared.logo(for: item) }
+        .task { await configureFromHistory() }
         .task(id: season) { await loadEpisodes() }
         .task(id: showSources) {
             // Query stream add-ons only when the picker opens.
@@ -136,10 +140,7 @@ struct DetailView: View {
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 12) {
-            if let logoURL {
-                LogoImage(url: logoURL).frame(maxWidth: 260, maxHeight: 90, alignment: .leading)
-                    .accessibilityLabel(item.name)
-            } else { Text(item.name).font(.largeTitle.bold()) }
+            TitleArt(item: item, maxWidth: 280, maxHeight: 100, font: .largeTitle.bold())
             if !metaLine.isEmpty { Text(metaLine).font(.subheadline).foregroundStyle(.secondary) }
             if let n = networkText {
                 Label(n, systemImage: isSeries ? "tv" : "building.2").font(.subheadline).foregroundStyle(.secondary)
@@ -150,6 +151,7 @@ struct DetailView: View {
                     .font(.headline).frame(maxWidth: .infinity)
             }
             .buttonStyle(.glassProminent).controlSize(.large)
+            resumeBanner
             if simkl.isConnected {
                 Button {
                     Task {
@@ -173,6 +175,78 @@ struct DetailView: View {
             }
         }
         .scrollIndicators(.hidden)
+    }
+
+    // MARK: Up next / continue
+
+    /// Opens on the episode you should watch: where you stopped, or the one after a finished episode.
+    private func configureFromHistory() async {
+        guard isSeries, let e = history.entry(for: item.id), let se = e.seasonEpisode else { return }
+        if e.isFinished {
+            guard let n = await UpNext.resolve(e) else { return }
+            upNext = n
+            if !explicitStart && !userPicked { season = n.season; episode = n.episode }
+        } else if e.position > 30, !explicitStart, !userPicked {
+            season = se.season; episode = se.episode
+        }
+    }
+
+    @ViewBuilder private var resumeBanner: some View {
+        if let n = upNext {
+            banner(thumb: n.thumb, label: "UP NEXT", title: "S\(n.season) · E\(n.episode)  \(n.title)",
+                   detail: n.runtime.map { "\($0) min" }, progress: nil) {
+                userPicked = true; season = n.season; episode = n.episode; showSources = true
+            }
+        } else if let e = history.entry(for: item.id), !e.isFinished, e.position > 30 {
+            let se = e.seasonEpisode
+            banner(thumb: e.thumb.flatMap(URL.init(string:)) ?? item.backdropURL, label: "CONTINUE",
+                   title: continueTitle(e),
+                   detail: "\(Fmt.clock(e.position)) · \(Fmt.remaining(e.duration - e.position))", progress: e.progress) {
+                if let se { userPicked = true; season = se.season; episode = se.episode }
+                showSources = true
+            }
+        }
+    }
+
+    private func continueTitle(_ e: WatchHistory.Entry) -> String {
+        guard let se = e.seasonEpisode else { return item.name }
+        var t = "S\(se.season) · E\(se.episode)"
+        if let n = e.episodeTitle, !n.isEmpty { t += "  \(n)" }
+        return t
+    }
+
+    private func banner(thumb: URL?, label: String, title: String, detail: String?, progress: Double?,
+                        action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                Color.clear.aspectRatio(16.0 / 9.0, contentMode: .fit).frame(width: 112)
+                    .overlay { RemoteImage(url: thumb, size: 112) }
+                    .overlay(alignment: .bottom) {
+                        if let progress {
+                            GeometryReader { g in
+                                ZStack(alignment: .leading) {
+                                    Rectangle().fill(.white.opacity(0.3))
+                                    Rectangle().fill(theme.gradient).frame(width: g.size.width * progress)
+                                }
+                            }
+                            .frame(height: 3)
+                        }
+                    }
+                    .overlay { Image(systemName: "play.fill").font(.footnote.weight(.bold)).foregroundStyle(.white)
+                        .frame(width: 30, height: 30).background(.ultraThinMaterial, in: Circle()) }
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(label).font(.caption2.weight(.heavy)).tracking(1).foregroundStyle(theme.accent)
+                    Text(title).font(.subheadline.weight(.semibold)).lineLimit(2).multilineTextAlignment(.leading)
+                    if let detail { Text(detail).font(.caption).foregroundStyle(.secondary) }
+                }
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.right").font(.footnote.weight(.bold)).foregroundStyle(.tertiary)
+            }
+            .padding(10)
+            .background(.quaternary.opacity(0.6), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        }
+        .buttonStyle(PressableStyle())
     }
 
     // MARK: Seasons + episodes
@@ -201,6 +275,7 @@ struct DetailView: View {
 
     private func select(season n: Int) {
         guard n != season else { return }
+        userPicked = true
         withAnimation(.snappy) { season = n; episode = 1; episodes = [] }
     }
 
@@ -275,7 +350,7 @@ struct DetailView: View {
 
     private func episodeCard(_ ep: EpisodeItem) -> some View {
         let selected = ep.id == episode
-        return Button { episode = ep.id; showSources = true } label: {
+        return Button { userPicked = true; episode = ep.id; showSources = true } label: {
             RemoteImage(url: ep.image, size: 300)
                 .frame(width: 280, height: 158)
                 .overlay(alignment: .bottom) {
@@ -433,6 +508,11 @@ struct DetailView: View {
             },
             resolve: { s, ep, current in
                 await SourceResolver.request(season: s, episode: ep, current: current, addons: addons, pins: pins)
+            },
+            next: { current in
+                guard let s = current.season, let e = current.episode,
+                      let n = await UpNext.next(for: item, after: s, e) else { return nil }
+                return NextEpisode(season: n.season, episode: n.episode)
             })
     }
 

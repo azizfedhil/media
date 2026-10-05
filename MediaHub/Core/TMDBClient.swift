@@ -14,6 +14,7 @@ actor TMDBClient {
     private var networkCache: [String: NetworkBadge] = [:]
     private var networkMisses: Set<String> = []
     private var seasonCache: [String: [EpisodeInfo]] = [:]
+    private var genreCache: [String: [Genre]] = [:]
 
     nonisolated var apiKey: String { UserDefaults.standard.string(forKey: "tmdb.key") ?? "" }
     nonisolated var hasKey: Bool { !apiKey.isEmpty }
@@ -25,6 +26,13 @@ actor TMDBClient {
     private struct Find: Decodable { let movieResults: [Item]; let tvResults: [Item] }
     private struct External: Decodable { let imdbId: String? }
     private struct SeasonResponse: Decodable { let episodes: [EpisodeInfo] }
+
+    struct Genre: Decodable, Identifiable, Hashable, Sendable { let id: Int; let name: String }
+    private struct GenreList: Decodable { let genres: [Genre] }
+    private struct ImageSet: Decodable {
+        struct Logo: Decodable { let filePath: String; let iso6391: String?; let voteAverage: Double?; let width: Int? }
+        let logos: [Logo]?
+    }
 
     private static let img = "https://image.tmdb.org/t/p/"
 
@@ -141,6 +149,59 @@ actor TMDBClient {
         return s.episodes
     }
 
+    /// Numeric TMDB id for any title id we hold ("tt…" or "tmdb:…").
+    func tmdbIdentifier(for id: String, type: String) async -> Int? {
+        guard hasKey else { return id.hasPrefix("tmdb:") ? Int(id.dropFirst(5)) : nil }
+        return try? await tmdbID(for: id, type: type)
+    }
+
+    /// Best title logo (transparent PNG): English or language-less, highest voted. SVGs are skipped (ImageIO can't draw them).
+    func logo(for id: String, type: String) async -> URL? {
+        guard hasKey, let tid = try? await tmdbID(for: id, type: type),
+              let set: ImageSet = try? await get("/\(kind(type))/\(tid)/images", ["include_image_language": "en,null"]) else { return nil }
+        let usable = (set.logos ?? []).filter { !$0.filePath.lowercased().hasSuffix(".svg") && ($0.iso6391 == "en" || $0.iso6391 == nil) }
+        let best = usable.max { a, b in
+            let la = a.iso6391 == "en" ? 1 : 0, lb = b.iso6391 == "en" ? 1 : 0
+            if la != lb { return la < lb }
+            if (a.voteAverage ?? 0) != (b.voteAverage ?? 0) { return (a.voteAverage ?? 0) < (b.voteAverage ?? 0) }
+            return (a.width ?? 0) < (b.width ?? 0)
+        }
+        return best.flatMap { URL(string: Self.img + "w500" + $0.filePath) }
+    }
+
+    /// Genre list for Explore ("movie" | "tv"), cached.
+    func genres(_ kind: String) async -> [Genre] {
+        if let hit = genreCache[kind] { return hit }
+        guard let g: GenreList = try? await get("/genre/\(kind)/list") else { return [] }
+        genreCache[kind] = g.genres
+        return g.genres
+    }
+
+    /// Filtered browsing for Explore.
+    func discover(kind: String, genre: Int?, year: Int?, sort: DiscoverSort, page: Int) async throws -> [MetaPreview] {
+        var q = ["page": String(page), "include_adult": "false"]
+        let dateField = kind == "tv" ? "first_air_date" : "primary_release_date"
+        switch sort {
+        case .popular: q["sort_by"] = "popularity.desc"
+        case .topRated:
+            q["sort_by"] = "vote_average.desc"
+            q["vote_count.gte"] = kind == "tv" ? "200" : "500"     // keeps one-vote wonders out of "top rated"
+        case .newest:
+            q["sort_by"] = dateField + ".desc"
+            q[dateField + ".lte"] = Self.today                      // nothing unreleased
+            q["vote_count.gte"] = "5"
+        }
+        if let genre { q["with_genres"] = String(genre) }
+        if let year { q[kind == "tv" ? "first_air_date_year" : "primary_release_year"] = String(year) }
+        let p: Page = try await get("/discover/\(kind)", q)
+        return p.results.map { preview($0, kind: kind) }
+    }
+
+    private static var today: String {
+        let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "yyyy-MM-dd"
+        return f.string(from: .now)
+    }
+
     func imdbID(tmdb id: Int, type: String) async -> String? {
         let e: External? = try? await get("/\(kind(type))/\(id)/external_ids")
         return e?.imdbId
@@ -154,4 +215,9 @@ actor TMDBClient {
         idCache[id] = found
         return found
     }
+}
+
+enum DiscoverSort: String, CaseIterable, Identifiable, Sendable {
+    case popular = "Popular", topRated = "Top rated", newest = "Newest"
+    var id: String { rawValue }
 }

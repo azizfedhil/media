@@ -123,12 +123,78 @@ struct SubCue: Equatable {
     }
 }
 
+/// User-chosen subtitle look. Persisted as one JSON string (`sub.style`), shared by Settings and the player.
+struct SubtitleStyle: Codable, Equatable {
+    var size: Double = 26            // px (points)
+    var color: String = "white"      // white, yellow, cyan, green, orange, pink
+    var weight: String = "semibold"  // regular, medium, semibold, bold, heavy
+    var font: String = "system"      // system, rounded, serif, mono
+    var edge: String = "shadow"      // none, shadow, outline
+    var boxOpacity: Double = 0       // 0 = no box, up to 0.9
+    var bottom: Double = 40          // distance from the bottom edge
+
+    static let storageKey = "sub.style"
+    static let colors: [(name: String, color: Color)] = [
+        ("white", .white), ("yellow", Color(red: 1, green: 0.9, blue: 0.2)), ("cyan", Color(red: 0.3, green: 0.9, blue: 1)),
+        ("green", Color(red: 0.4, green: 1, blue: 0.5)), ("orange", Color(red: 1, green: 0.65, blue: 0.2)),
+        ("pink", Color(red: 1, green: 0.55, blue: 0.75)),
+    ]
+    static func decode(_ json: String) -> SubtitleStyle {
+        guard let d = json.data(using: .utf8), let s = try? JSONDecoder().decode(SubtitleStyle.self, from: d) else { return SubtitleStyle() }
+        return s
+    }
+    var encoded: String { (try? JSONEncoder().encode(self)).flatMap { String(data: $0, encoding: .utf8) } ?? "" }
+
+    var textColor: Color { Self.colors.first { $0.name == color }?.color ?? .white }
+    var fontWeight: Font.Weight {
+        switch weight { case "regular": return .regular; case "medium": return .medium; case "bold": return .bold
+        case "heavy": return .heavy; default: return .semibold }
+    }
+    var design: Font.Design {
+        switch font { case "rounded": return .rounded; case "serif": return .serif; case "mono": return .monospaced; default: return .default }
+    }
+}
+
+/// Subtitle languages offered as the default. `matches` copes with "en", "eng", "en-US" and "English".
+enum SubLanguages {
+    struct Lang: Identifiable, Hashable { let code: String; let name: String; let aliases: [String]; var id: String { code } }
+    static let all: [Lang] = [
+        .init(code: "en", name: "English", aliases: ["eng"]), .init(code: "ar", name: "Arabic", aliases: ["ara"]),
+        .init(code: "fr", name: "French", aliases: ["fra", "fre"]), .init(code: "es", name: "Spanish", aliases: ["spa"]),
+        .init(code: "de", name: "German", aliases: ["deu", "ger"]), .init(code: "it", name: "Italian", aliases: ["ita"]),
+        .init(code: "pt", name: "Portuguese", aliases: ["por", "pob"]), .init(code: "ru", name: "Russian", aliases: ["rus"]),
+        .init(code: "tr", name: "Turkish", aliases: ["tur"]), .init(code: "ja", name: "Japanese", aliases: ["jpn"]),
+        .init(code: "ko", name: "Korean", aliases: ["kor"]), .init(code: "zh", name: "Chinese", aliases: ["zho", "chi", "cmn"]),
+        .init(code: "hi", name: "Hindi", aliases: ["hin"]), .init(code: "nl", name: "Dutch", aliases: ["nld", "dut"]),
+        .init(code: "pl", name: "Polish", aliases: ["pol"]), .init(code: "sv", name: "Swedish", aliases: ["swe"]),
+        .init(code: "da", name: "Danish", aliases: ["dan"]), .init(code: "no", name: "Norwegian", aliases: ["nor", "nob"]),
+        .init(code: "fi", name: "Finnish", aliases: ["fin"]), .init(code: "el", name: "Greek", aliases: ["ell", "gre"]),
+        .init(code: "he", name: "Hebrew", aliases: ["heb"]), .init(code: "id", name: "Indonesian", aliases: ["ind"]),
+        .init(code: "th", name: "Thai", aliases: ["tha"]), .init(code: "vi", name: "Vietnamese", aliases: ["vie"]),
+        .init(code: "uk", name: "Ukrainian", aliases: ["ukr"]), .init(code: "cs", name: "Czech", aliases: ["ces", "cze"]),
+        .init(code: "hu", name: "Hungarian", aliases: ["hun"]), .init(code: "ro", name: "Romanian", aliases: ["ron", "rum"]),
+    ]
+
+    /// Two-letter code for any spelling of a language, or nil if unknown.
+    static func canonical(_ raw: String?) -> String? {
+        guard var l = raw?.lowercased().trimmingCharacters(in: .whitespaces), !l.isEmpty else { return nil }
+        if let i = l.firstIndex(where: { $0 == "-" || $0 == "_" }) { l = String(l[..<i]) }
+        for lang in all {
+            if l == lang.code || lang.aliases.contains(l) || l == lang.name.lowercased() { return lang.code }
+        }
+        return nil
+    }
+    static func matches(_ track: String?, _ wanted: String) -> Bool {
+        if let a = canonical(track), let b = canonical(wanted) { return a == b }
+        return track?.lowercased() == wanted.lowercased()
+    }
+}
+
 /// Paints the active cues over the video. Text is drawn natively; PGS / DVD bitmaps are placed on a 16:9 canvas.
 struct SubtitleOverlay: View {
     let cues: [SubCue]
     let lift: CGFloat
-    /// User-chosen text size multiplier (1 = default).
-    var scale: CGFloat = 1
+    var style = SubtitleStyle()
 
     var body: some View {
         GeometryReader { geo in
@@ -142,13 +208,9 @@ struct SubtitleOverlay: View {
                 if !lines.isEmpty {
                     VStack {
                         Spacer(minLength: 0)
-                        Text(lines)
-                            .font(.system(size: (size.width > 700 ? 30 : 21) * scale, weight: .semibold))
-                            .multilineTextAlignment(.center)
-                            .foregroundStyle(.white)
-                            .shadow(color: .black, radius: 1.5).shadow(color: .black, radius: 3)
+                        label(lines)
                             .frame(maxWidth: size.width * 0.9)
-                            .padding(.bottom, 40 + lift)
+                            .padding(.bottom, style.bottom + lift)
                     }
                     .frame(maxWidth: .infinity)
                 }
@@ -159,6 +221,27 @@ struct SubtitleOverlay: View {
         .allowsHitTesting(false)
     }
 
+    @ViewBuilder private func label(_ text: String) -> some View {
+        let base = Text(text)
+            .font(.system(size: style.size, weight: style.fontWeight, design: style.design))
+            .multilineTextAlignment(.center)
+            .foregroundStyle(style.textColor)
+        let boxed = style.boxOpacity > 0.01
+        Group {
+            switch style.edge {
+            case "none":
+                base
+            case "outline":
+                base.shadow(color: .black, radius: 0, x: 1.3, y: 0).shadow(color: .black, radius: 0, x: -1.3, y: 0)
+                    .shadow(color: .black, radius: 0, x: 0, y: 1.3).shadow(color: .black, radius: 0, x: 0, y: -1.3)
+            default:
+                base.shadow(color: .black, radius: 1.5).shadow(color: .black, radius: 3)
+            }
+        }
+        .padding(.horizontal, boxed ? 12 : 0).padding(.vertical, boxed ? 5 : 0)
+        .background(.black.opacity(style.boxOpacity), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
     @ViewBuilder private func bitmap(_ cue: SubCue, video: CGRect, size: CGSize) -> some View {
         if let img = cue.image {
             let pic = Image(decorative: img, scale: 1).resizable()
@@ -167,9 +250,9 @@ struct SubtitleOverlay: View {
                     .position(x: video.minX + r.midX * video.width, y: video.minY + r.midY * video.height)
             } else {
                 pic.scaledToFit()
-                    .frame(maxWidth: size.width * 0.9, maxHeight: size.height * 0.3 * min(scale, 1.5))
+                    .frame(maxWidth: size.width * 0.9, maxHeight: size.height * 0.3)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-                    .padding(.bottom, 40 + lift)
+                    .padding(.bottom, style.bottom + lift)
             }
         }
     }

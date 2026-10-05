@@ -12,6 +12,21 @@ final class HomeModel {
     var rows: [CatalogRow] = []
     var suggested: [CatalogRow] = []
     var lists: [CatalogRow] = []
+    var upNext: [UpNextItem] = []
+
+    /// Next episode for each show whose last episode you finished. Resolved concurrently, order kept.
+    func loadUpNext(_ entries: [WatchHistory.Entry]) async {
+        let batch = Array(entries.prefix(8))
+        guard !batch.isEmpty else { upNext = []; return }
+        var done: [Int: UpNextItem] = [:]
+        await withTaskGroup(of: (Int, UpNextItem?).self) { group in
+            for (i, e) in batch.enumerated() { group.addTask { (i, await UpNext.resolve(e)) } }
+            for await (i, n) in group {
+                if let n { done[i] = n }
+                upNext = done.keys.sorted().compactMap { done[$0] }
+            }
+        }
+    }
 
     func loadLists(selected: Set<Int>) async {
         guard MDBListClient.shared.hasKey, !selected.isEmpty else { lists = []; return }
@@ -93,12 +108,12 @@ final class HomeModel {
 
 extension CatalogRow {
     /// Colour of the row's title icon.
-    var accent: Color {
+    func accent(_ theme: ThemeStore) -> Color {
         switch id {
-        case "because": return Theme.accent2
+        case "because": return theme.accent2
         case "trend-movie": return .orange
         case "trend-tv": return .cyan
-        default: return id.hasPrefix("mdb-") ? .teal : Theme.accent
+        default: return id.hasPrefix("mdb-") ? .teal : theme.accent
         }
     }
 }
@@ -106,12 +121,13 @@ extension CatalogRow {
 struct HomeView: View {
     @Environment(AddonStore.self) private var store
     @Environment(WatchHistory.self) private var history
+    @Environment(ThemeStore.self) private var theme
     @AppStorage("tmdb.key") private var tmdbKey = ""
     @AppStorage("mdblist.key") private var mdbKey = ""
     @AppStorage("mdblist.lists") private var mdbLists = ""
     @State private var model = HomeModel()
     /// Colour pulled from the current hero artwork; washes softly behind the first rows.
-    @State private var tint: Color = Theme.accent
+    @State private var tint: Color?
     private var selectedLists: Set<Int> { Set(mdbLists.split(separator: ",").compactMap { Int($0) }) }
 
     var body: some View {
@@ -120,12 +136,13 @@ struct HomeView: View {
                 LazyVStack(alignment: .leading, spacing: 30) {
                     if !model.hero.isEmpty { HeroCarousel(items: model.hero, tint: $tint) }
                     if !history.continueEntries.isEmpty { ContinueRow(entries: history.continueEntries) }
+                    if !model.upNext.isEmpty { UpNextRow(items: model.upNext) }
                     ForEach(model.suggested) { CatalogRowView(row: $0) }
                     ForEach(model.lists) { CatalogRowView(row: $0) }
                     ForEach(model.rows) { CatalogRowView(row: $0) }
                 }
                 .padding(.bottom, 40)
-                .animation(.smooth(duration: 0.5), value: model.rows.count + model.suggested.count + model.lists.count)
+                .animation(.smooth(duration: 0.5), value: model.rows.count + model.suggested.count + model.lists.count + model.upNext.count)
                 .background(alignment: .top) { ambient }
             }
             .ignoresSafeArea(edges: .top)
@@ -138,11 +155,13 @@ struct HomeView: View {
             .task(id: store.addons.map(\.id)) { await model.load(addons: store.addons) }
             .task(id: mdbKey + mdbLists) { await model.loadLists(selected: selectedLists) }
             .task(id: tmdbKey + (history.lastWatched?.id ?? "")) { await model.loadSuggestions(last: history.lastWatched) }
+            .task(id: history.finishedSeries.map(\.id).joined(separator: ",")) { await model.loadUpNext(history.finishedSeries) }
         }
     }
 
-    private var ambient: some View {
-        LinearGradient(colors: [tint.opacity(0.7), tint.opacity(0.25), .clear], startPoint: .top, endPoint: .bottom)
+    @ViewBuilder private var ambient: some View {
+        let t = tint ?? theme.accent
+        LinearGradient(colors: [t.opacity(0.7), t.opacity(0.25), .clear], startPoint: .top, endPoint: .bottom)
             .frame(height: 1100)
             .allowsHitTesting(false)
     }
@@ -151,7 +170,8 @@ struct HomeView: View {
         async let a: () = model.load(addons: store.addons)
         async let b: () = model.loadSuggestions(last: history.lastWatched)
         async let c: () = model.loadLists(selected: selectedLists)
-        _ = await (a, b, c)
+        async let d: () = model.loadUpNext(history.finishedSeries)
+        _ = await (a, b, c, d)
     }
 }
 
@@ -159,7 +179,7 @@ struct HomeView: View {
 
 struct HeroCarousel: View {
     let items: [MetaPreview]
-    @Binding var tint: Color
+    @Binding var tint: Color?
     @Environment(\.horizontalSizeClass) private var hSize
     @State private var page: String?
     @State private var visible = true
@@ -255,10 +275,8 @@ private struct HeroPage: View {
                     .background(.white.opacity(0.18), in: Capsule())
                 if let y = item.year { Text(String(y)).font(.subheadline.weight(.semibold)).opacity(0.9) }
             }
-            Text(item.name)
-                .font(.system(size: 38, weight: .heavy, design: .rounded))
-                .lineLimit(2).minimumScaleFactor(0.7)
-                .shadow(color: .black.opacity(0.5), radius: 10, y: 2)
+            // Logo when we have one, title text otherwise (text shows first, then swaps once the logo has loaded).
+            TitleArt(item: item, maxWidth: 270, maxHeight: 86, font: .system(size: 38, weight: .heavy, design: .rounded))
             InlineRatings(item: item)
             if let d = item.description, !d.isEmpty {
                 Text(d).font(.subheadline).lineLimit(2).opacity(0.85)
@@ -346,11 +364,12 @@ struct InlineRatings: View {
 
 struct ContinueRow: View {
     let entries: [WatchHistory.Entry]
+    @Environment(ThemeStore.self) private var theme
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 8) {
-                Image(systemName: "play.circle.fill").font(.system(size: 15, weight: .bold)).foregroundStyle(Theme.accent2)
+                Image(systemName: "play.circle.fill").font(.system(size: 15, weight: .bold)).foregroundStyle(theme.accent2)
                 Text("Continue Watching").font(.title3.bold())
             }
             .padding(.horizontal, 16)
@@ -371,6 +390,7 @@ struct ContinueRow: View {
 private struct ContinueCard: View {
     let entry: WatchHistory.Entry
     @Environment(WatchHistory.self) private var history
+    @Environment(ThemeStore.self) private var theme
     private let width: CGFloat = 270
 
     private var thumb: URL? {
@@ -421,10 +441,71 @@ private struct ContinueCard: View {
         GeometryReader { g in
             ZStack(alignment: .leading) {
                 Rectangle().fill(.white.opacity(0.3))
-                Rectangle().fill(Theme.gradient).frame(width: g.size.width * entry.progress)
+                Rectangle().fill(theme.gradient).frame(width: g.size.width * entry.progress)
             }
         }
         .frame(height: 4)
+    }
+}
+
+// MARK: - Up Next
+
+/// The next episode of shows you finished an episode of.
+struct UpNextRow: View {
+    let items: [UpNextItem]
+    @Environment(ThemeStore.self) private var theme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: "forward.end.circle.fill").font(.system(size: 15, weight: .bold)).foregroundStyle(theme.accent)
+                Text("Up Next").font(.title3.bold())
+            }
+            .padding(.horizontal, 16)
+            ScrollView(.horizontal) {
+                LazyHStack(spacing: 14) {
+                    ForEach(items) { UpNextCard(entry: $0) }
+                }
+                .scrollTargetLayout()
+            }
+            .contentMargins(.horizontal, 16, for: .scrollContent)
+            .scrollTargetBehavior(.viewAligned)
+            .scrollIndicators(.hidden)
+        }
+    }
+}
+
+private struct UpNextCard: View {
+    let entry: UpNextItem
+    @Environment(ThemeStore.self) private var theme
+    private let width: CGFloat = 270
+
+    var body: some View {
+        NavigationLink(value: ResumeTarget(item: entry.item, season: entry.season, episode: entry.episode)) {
+            VStack(alignment: .leading, spacing: 8) {
+                Color.clear
+                    .aspectRatio(16.0 / 9.0, contentMode: .fit)
+                    .frame(width: width)
+                    .overlay { RemoteImage(url: entry.thumb, size: width) }
+                    .overlay { LinearGradient(colors: [.clear, .black.opacity(0.5)], startPoint: .center, endPoint: .bottom) }
+                    .overlay {
+                        Image(systemName: "play.fill").font(.system(size: 16, weight: .bold)).foregroundStyle(.white)
+                            .frame(width: 42, height: 42).background(.ultraThinMaterial, in: Circle())
+                    }
+                    .overlay(alignment: .topLeading) {
+                        Text("UP NEXT").font(.system(size: 10, weight: .heavy)).tracking(0.8).foregroundStyle(.white)
+                            .padding(.horizontal, 8).padding(.vertical, 4)
+                            .background(theme.accent, in: Capsule()).padding(8)
+                    }
+                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(entry.item.name).font(.subheadline.weight(.semibold)).lineLimit(1)
+                    Text("S\(entry.season) · E\(entry.episode) · \(entry.title)").font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+                .frame(width: width, alignment: .leading)
+            }
+        }
+        .buttonStyle(PressableStyle())
     }
 }
 
@@ -432,6 +513,7 @@ private struct ContinueCard: View {
 
 struct CatalogRowView: View {
     let row: CatalogRow
+    @Environment(ThemeStore.self) private var theme
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -439,7 +521,7 @@ struct CatalogRowView: View {
             NavigationLink(value: row) {
                 HStack(spacing: 8) {
                     if let s = row.symbol {
-                        Image(systemName: s).font(.system(size: 15, weight: .bold)).foregroundStyle(row.accent)
+                        Image(systemName: s).font(.system(size: 15, weight: .bold)).foregroundStyle(row.accent(theme))
                     }
                     Text(row.title).font(.title3.bold())
                     Image(systemName: "chevron.right").font(.footnote.weight(.bold)).foregroundStyle(.secondary)

@@ -3,65 +3,90 @@ import SwiftUI
 struct SettingsView: View {
     @Environment(AddonStore.self) private var store
     @Environment(SimklStore.self) private var simkl
-    @AppStorage("simkl.clientID") private var simklID = ""
-    @AppStorage("mdblist.key") private var mdbKey = ""
-    @AppStorage("tvdb.key") private var tvdbKey = ""
-    @AppStorage("tvdb.pin") private var tvdbPin = ""
+    @Environment(ThemeStore.self) private var theme
     @AppStorage("tmdb.key") private var tmdbKey = ""
+    @AppStorage("tvdb.key") private var tvdbKey = ""
+    @AppStorage("mdblist.key") private var mdbKey = ""
     @AppStorage("ui.networkBadges") private var networkBadges = true
+    @AppStorage("ui.titleLogos") private var titleLogos = true
+    @AppStorage("player.glass") private var glass = true
+    @AppStorage("player.autoplayNext") private var autoplayNext = true
+    @AppStorage("skip.enabled") private var skipEnabled = true
+    @AppStorage("skip.fallbackSeconds") private var fallbackSkip = 85
+    @AppStorage("sub.lang") private var subLang = "off"
     @State private var urlText = ""
     @State private var error: String?
     @State private var busy = false
+
+    private var connected: Int {
+        [!tmdbKey.isEmpty, !tvdbKey.isEmpty, !mdbKey.isEmpty, simkl.isConnected].filter { $0 }.count
+    }
 
     var body: some View {
         NavigationStack {
             Form {
                 Section {
-                    SecureField("TMDB API key", text: $tmdbKey)
-                        .textInputAutocapitalization(.never).autocorrectionDisabled()
-                } header: { Text("Metadata & suggestions") } footer: {
-                    Text("Free key at themoviedb.org/settings/api. This product uses the TMDB API but is not endorsed or certified by TMDB.")
-                }
-                Section {
-                    SecureField("TVDB API key", text: $tvdbKey)
-                        .textInputAutocapitalization(.never).autocorrectionDisabled()
-                    SecureField("PIN (subscriber keys only)", text: $tvdbPin)
-                        .textInputAutocapitalization(.never).autocorrectionDisabled()
-                } header: { Text("TheTVDB") } footer: {
-                    Text("Adds episode thumbnails and title logos. Metadata provided by TheTVDB. Get a key at thetvdb.com/api-information.")
-                }
-                Section {
-                    SecureField("MDBList API key", text: $mdbKey)
-                        .textInputAutocapitalization(.never).autocorrectionDisabled()
-                    if !mdbKey.isEmpty { NavigationLink("Choose lists") { MDBListPicker() } }
-                } header: { Text("MDBList") } footer: {
-                    Text("Adds IMDb, Rotten Tomatoes, Metacritic and Letterboxd ratings, and your lists on Home. Get a key at mdblist.com/preferences.")
-                }
-                Section {
-                    if simkl.isConnected {
-                        Label("Connected", systemImage: "checkmark.circle.fill")
-                        Button("Sync now") { Task { await simkl.sync(force: true) } }
-                        Button("Disconnect", role: .destructive) { simkl.disconnect() }
-                    } else {
-                        TextField("Simkl client ID", text: $simklID)
-                            .textInputAutocapitalization(.never).autocorrectionDisabled()
-                        if let pin = simkl.pin {
-                            VStack(alignment: .leading, spacing: 6) {
-                                Text(pin.userCode).font(.largeTitle.monospaced().bold()).textSelection(.enabled)
-                                if let u = URL(string: pin.verificationUrl) { Link("Enter this code at \(pin.verificationUrl)", destination: u) }
-                                ProgressView()
-                            }
-                        } else { Button("Connect Simkl") { simkl.connect() } }
-                        if let e = simkl.loginError { Text(e).foregroundStyle(.red) }
+                    NavigationLink { IntegrationsView() } label: {
+                        HStack {
+                            Label("Integrations", systemImage: "puzzlepiece.extension.fill")
+                            Spacer()
+                            Text("\(connected) of 4 set up").font(.footnote).foregroundStyle(.secondary)
+                        }
                     }
-                } header: { Text("Simkl") } footer: {
-                    Text("Create a free app at simkl.com/settings/developer to get a client ID.")
+                } footer: {
+                    Text("TMDB, TheTVDB, MDBList and Simkl: API keys, logins and metadata sources.")
                 }
-                Section {
+
+                Section("Appearance") {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("Accent colour").font(.subheadline.weight(.medium))
+                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 40), spacing: 12)], spacing: 12) {
+                            ForEach(Theme.presets, id: \.hex) { p in
+                                Button { theme.setAccent(hex: p.hex) } label: {
+                                    Circle().fill(Color(hex: p.hex) ?? .gray).frame(width: 36, height: 36)
+                                        .overlay {
+                                            if theme.hex.uppercased() == p.hex {
+                                                Image(systemName: "checkmark").font(.footnote.weight(.black)).foregroundStyle(.white)
+                                            }
+                                        }
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel(p.name)
+                            }
+                        }
+                        ColorPicker("Custom colour", selection: Binding(get: { theme.accent },
+                                                                          set: { theme.setAccent(hex: $0.hexString) }),
+                                    supportsOpacity: false)
+                    }
+                    .padding(.vertical, 4)
                     Toggle("Network icons on posters", isOn: $networkBadges)
-                } header: { Text("Interface") } footer: {
-                    Text("Shows the network (Netflix, HBO...) on show posters. Needs a TMDB key and makes one small request per visible poster.")
+                    Toggle("Logos instead of title text", isOn: $titleLogos)
+                } footer: {
+                    Text("Network icons need a TMDB key and make one small request per visible poster. Logos come from TMDB, TheTVDB and Metahub and are cached after the first lookup.")
                 }
+
+                Section {
+                    NavigationLink {
+                        SubtitleSettingsView()
+                    } label: {
+                        HStack {
+                            Label("Subtitles", systemImage: "captions.bubble")
+                            Spacer()
+                            Text(subLang == "off" ? "Off" : (SubLanguages.all.first { $0.code == subLang }?.name ?? subLang))
+                                .font(.footnote).foregroundStyle(.secondary)
+                        }
+                    }
+                    Toggle("Liquid Glass controls", isOn: $glass)
+                    Toggle("Autoplay next episode", isOn: $autoplayNext)
+                    Toggle("Skip intro / recap / credits", isOn: $skipEnabled)
+                    if skipEnabled {
+                        Stepper(fallbackSkip == 0 ? "Manual skip button: off" : "Manual skip button: \(fallbackSkip) s",
+                                value: $fallbackSkip, in: 0...180, step: 5)
+                    }
+                } header: { Text("Playback") } footer: {
+                    Text("Skip buttons use community timestamps from TheIntroDB. When a show has none, the manual button jumps ahead by the chosen time. Set it to 0 to hide it. Turn Liquid Glass off if playback ever feels heavy on an older device.")
+                }
+
                 Section("Add-ons") {
                     ForEach(store.addons) { a in
                         VStack(alignment: .leading) {
