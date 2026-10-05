@@ -26,6 +26,8 @@ struct PlayRequest: Identifiable {
 final class Playhead {
     var position: Double = 0
     var duration: Double = 0
+    /// Source-time position buffered ahead of the playhead (seek bar's lighter segment).
+    var buffered: Double = 0
     @ObservationIgnored var scrubbing = false
 }
 
@@ -86,17 +88,24 @@ final class PlayerModel {
         guard let engine else { return }
         bind(engine)
         resetForNewItem()
+        let startAt = (resume ?? 0) > 30 ? (resume ?? 0) : 0
+        if startAt > 0 { playhead.position = startAt }      // seek bar shows the resume point while loading
         do {
             if replacing { engine.stop() }
-            // Prefetch the entire source to disk from the first byte, wherever the playhead is. The engine bounds
-            // this by a byte budget tied to free storage, buffers as much as safely fits, then tracks playback.
             var options = LoadOptions(httpHeaders: r.headers)
-            options.forwardBufferSegments = Int.max
-            try await engine.load(url: r.url, options: options)
+            // ~10 min of look-ahead (150 x ~4 s segments). That is the largest window the engine accepts without
+            // opting out of its 2 GiB retention cap, so a seek or a reconnect never competes with a whole-film
+            // download for bandwidth. Raise it if you'd rather trade disk and data for a longer cushion.
+            options.forwardBufferSegments = 150
+            // Remote files: cap the open-time probe (engine defaults are 50 MB / 60 s, tuned for local disk).
+            options.probesize = 16 * 1024 * 1024
+            options.maxAnalyzeDuration = 10 * 1_000_000
+            // Open straight at the resume point. Loading at 0:00, playing, then seeking made the engine fetch the
+            // head of the file, throw it away, and restart its producer at the target: the cut-and-reload on resume.
+            try await engine.load(url: r.url, startPosition: startAt, options: options)
             // The screen may have been closed while the source was loading.
             if isShutDown { engine.stop(); return }
             engine.play()
-            if let resume, resume > 30 { await engine.seek(to: resume) }
         } catch {
             self.error = error.localizedDescription
             setBuffering(false)
@@ -107,7 +116,7 @@ final class PlayerModel {
         error = nil; didEnd = false
         isPlaying = false; isPaused = false
         setBuffering(true); showSpinner = true
-        playhead.position = 0; playhead.duration = 0
+        playhead.position = 0; playhead.duration = 0; playhead.buffered = 0
         seekTask?.cancel(); pendingTarget = nil; seekInFlight = false
         allCues = []; mappedCount = 0; mappedFirst = nil; activeCues = []
         activeSubtitleID = nil; subtitleTracks = []; audioTracks = []; activeAudioID = nil
@@ -140,6 +149,13 @@ final class PlayerModel {
             .sink { [weak self] t in
                 guard let self, !playhead.scrubbing, !seekInFlight else { return }
                 playhead.position = Double(t)
+            }.store(in: &bag)
+        // Buffered-ahead position drives the lighter segment of the seek bar; 2 Hz is plenty.
+        engine.clock.$bufferedPosition
+            .throttle(for: .milliseconds(500), scheduler: DispatchQueue.main, latest: true)
+            .sink { [weak self] b in
+                // Reflect copes with the engine publishing Double, Float or an optional of either.
+                self?.playhead.buffered = Reflect.unwrap(b).flatMap(Reflect.number) ?? 0
             }.store(in: &bag)
         // Subtitle cues arrive as one cumulative list in source time; only new cues are converted.
         engine.$subtitleCues.receive(on: DispatchQueue.main).sink { [weak self] cues in
@@ -1048,11 +1064,22 @@ private struct SeekBar: View {
             GeometryReader { geo in
                 let w = max(geo.size.width, 1)
                 let frac = min(max(shown / dur, 0), 1)
+                // Buffered region = from the playhead to the end of what is downloaded ahead of it.
+                let posFrac = min(max(playhead.position / dur, 0), 1)
+                let bufFrac = min(max(max(playhead.buffered, playhead.position) / dur, 0), 1)
                 let h: CGFloat = active ? 20 : 12
                 let knob: CGFloat = 30
                 ZStack(alignment: .leading) {
                     Capsule().fill(Color.clear).frame(height: h)
                         .modifier(GlassCapsule(on: glass))
+                    ZStack(alignment: .leading) {
+                        Rectangle().fill(.white.opacity(0.38))
+                            .frame(width: max(w * (bufFrac - posFrac), 0))
+                            .offset(x: w * posFrac)
+                    }
+                    .frame(width: w, height: h, alignment: .leading)
+                    .clipShape(Capsule())
+                    .animation(.linear(duration: 0.4), value: bufFrac)
                     // The fill is a plain rectangle clipped by the track shape, so only its left end is rounded.
                     ZStack(alignment: .leading) {
                         Rectangle().fill(.white).frame(width: w * frac)
