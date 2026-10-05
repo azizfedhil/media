@@ -1,17 +1,30 @@
 import Foundation
 import Observation
 
-/// Response of `GET /oauth/pin`. `deviceCode` is parsed but not needed: polling uses the user code.
-struct PinResponse: Decodable, Sendable {
-    let result: String?
-    let deviceCode: String?
-    let userCode: String
-    let verificationUrl: String
-    let expiresIn: Int
-    let interval: Int
+/// Response of `POST /oauth2/device` (AUTH V2, RFC 8628). Decoded with `.convertFromSnakeCase`.
+/// `deviceCode` is the polling credential: it is never shown, logged or put in a URL.
+struct DeviceAuthorization: Decodable, Sendable {
+    let deviceCode: String
+    let userCode: String                    // shown exactly as returned, hyphen included ("BDWP-HQPK")
+    let verificationUri: String             // "https://simkl.com/pin"
+    let verificationUriComplete: String?    // same page with the code pre-filled
+    let expiresIn: Int                      // 900
+    let interval: Int?                      // 5
+
+    var verificationUrl: String { verificationUri }
+    var completeURL: URL? { verificationUriComplete.flatMap(URL.init(string:)) }
 }
 
-private struct PollResponse: Decodable { let result: String?; let message: String?; let accessToken: String? }
+/// Token response of `POST /oauth2/token`, identical for the device, refresh and code grants.
+private struct TokenResponse: Decodable {
+    let accessToken: String
+    let refreshToken: String?
+    let expiresIn: Int?                     // always 604800 (7 days)
+    let scope: String?                      // "media:read" or "media:read media:write"
+}
+
+/// RFC 6749 error envelope: branch on `error`, never on `errorDescription`.
+private struct OAuthError: Decodable { let error: String; let errorDescription: String? }
 
 /// Skips one malformed entry instead of failing the whole library.
 private struct Lossy<T: Decodable>: Decodable {
@@ -52,10 +65,14 @@ private enum SimklError: LocalizedError {
     }
 }
 
-private enum PollResult { case token(String), pending, failed(String), transient }
+private enum PollResult { case tokens(TokenResponse), pending, slowDown, failed(String), transient }
 
-/// Simkl via the PIN / device-code flow. It needs only a client ID: no redirect URL, no client secret, no browser
-/// callback, so it works inside LiveContainer where OAuth redirects can't return to the app.
+/// Simkl AUTH V2 via the OAuth 2.0 device flow (RFC 8628): `POST /oauth2/device`, then poll `POST /oauth2/token`.
+/// It needs only a client ID: no redirect URL, no client secret, no browser callback, so it works inside
+/// LiveContainer where OAuth redirects can't return to the app.
+///
+/// V2 access tokens last 7 days; the refresh token (180 days, sliding) is kept in the Keychain and used
+/// automatically, so the user is not sent back through the code screen.
 ///
 /// Network use is event-driven: sync on foreground (max every 15 min) or pull-to-refresh, scrobble start/stop only.
 @MainActor @Observable
@@ -63,12 +80,18 @@ final class SimklStore {
     private(set) var token: String? = Keychain.get("simkl.token")
     private(set) var library: [CatalogRow] = []
     private(set) var isSyncing = false
-    private(set) var pin: PinResponse?
+    private(set) var pin: DeviceAuthorization?
     private(set) var loginError: String?
     private(set) var loginStatus: String?
     private(set) var syncError: String?
     @ObservationIgnored private var lastSync: Date?
     @ObservationIgnored private var loginTask: Task<Void, Never>?
+    @ObservationIgnored private var refreshToken: String? = Keychain.get("simkl.refresh")
+    @ObservationIgnored private var tokenExpiry: Date? = UserDefaults.standard.object(forKey: "simkl.tokenExpiry") as? Date
+    /// One refresh at a time: V2 refreshing replaces the access token, so two overlapping refreshes would
+    /// invalidate each other.
+    @ObservationIgnored private var refreshTask: Task<Bool, Never>?
+    private static let expiryKey = "simkl.tokenExpiry"
 
     var isConnected: Bool { token != nil }
     /// Trimmed: a pasted ID with a trailing space or newline is the most common reason a login "does nothing".
@@ -78,17 +101,25 @@ final class SimklStore {
 
     // MARK: HTTP
 
+    private static let appName = "mediahub"
+    private static let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0"
+    private static var userAgent: String { "MediaHub/\(appVersion)" }
+
+    /// Every Simkl API call carries `client_id`, `app-name` and `app-version` as URL parameters plus a User-Agent.
     private func request(_ path: String, query: [String: String] = [:], method: String = "GET",
                          body: [String: Any]? = nil, auth: Bool = true) -> URLRequest {
         var c = URLComponents(string: "https://api.simkl.com" + path)!
-        if !query.isEmpty { c.queryItems = query.map { URLQueryItem(name: $0.key, value: $0.value) } }
+        c.queryItems = query.map { URLQueryItem(name: $0.key, value: $0.value) } + [
+            URLQueryItem(name: "client_id", value: clientID),
+            URLQueryItem(name: "app-name", value: Self.appName),
+            URLQueryItem(name: "app-version", value: Self.appVersion),
+        ]
         var r = URLRequest(url: c.url!)
         r.httpMethod = method
         r.timeoutInterval = 20
-        r.setValue(clientID, forHTTPHeaderField: "simkl-api-key")
         r.setValue("application/json", forHTTPHeaderField: "Content-Type")
         r.setValue("application/json", forHTTPHeaderField: "Accept")
-        r.setValue("MediaHub/1.0", forHTTPHeaderField: "User-Agent")
+        r.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
         if auth, let t = token { r.setValue("Bearer \(t)", forHTTPHeaderField: "Authorization") }
         if let body { r.httpBody = try? JSONSerialization.data(withJSONObject: body) }
         return r
@@ -106,43 +137,87 @@ final class SimklStore {
         return try dec.decode(T.self, from: d)
     }
 
-    // MARK: PIN login
+    /// OAuth endpoints take a form-encoded body and no Authorization header.
+    private func oauthRequest(_ path: String, form: [String: String]) -> URLRequest {
+        var r = URLRequest(url: URL(string: "https://api.simkl.com" + path)!)
+        r.httpMethod = "POST"
+        r.timeoutInterval = 20
+        r.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        r.setValue("application/json", forHTTPHeaderField: "Accept")
+        r.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
+        let safe = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~"))
+        r.httpBody = form.map { "\($0.key)=\($0.value.addingPercentEncoding(withAllowedCharacters: safe) ?? $0.value)" }
+            .joined(separator: "&").data(using: .utf8)
+        return r
+    }
 
-    /// 1. GET /oauth/pin?client_id=…  2. show user_code + verification_url  3. poll /oauth/pin/{user_code}
-    /// no faster than `interval`, while result == "KO"  4. on "OK" store access_token  5. stop at `expires_in`.
+    private static func status(_ resp: URLResponse) -> Int { (resp as? HTTPURLResponse)?.statusCode ?? 0 }
+
+    /// Authenticated call: refreshes a token that is about to expire first, and on a 401 refreshes once and retries.
+    private func sendAuthed<T: Decodable>(_ make: () -> URLRequest) async throws -> T {
+        await refreshIfNeeded()
+        do { return try await send(make()) }
+        catch SimklError.http(let code, let body) where code == 401 {
+            guard await refreshIfNeeded(force: true) else { throw SimklError.http(code, body) }
+            return try await send(make())
+        }
+    }
+
+    // MARK: Device login (AUTH V2)
+
+    /// 1. POST /oauth2/device (client_id, scope)  2. show user_code + verification_uri  3. poll POST /oauth2/token
+    /// every `interval` seconds  4. on tokens: store them  5. stop at `expires_in` (declining is never signalled).
     func connect() {
         loginTask?.cancel()
         loginError = nil; loginStatus = nil; pin = nil
         let cid = clientID
         guard !cid.isEmpty else { loginError = "Enter your Simkl client ID first."; return }
-        loginTask = Task { await runPinFlow(clientID: cid) }
+        loginTask = Task { await runDeviceFlow(clientID: cid) }
     }
 
     func cancelLogin() {
         loginTask?.cancel(); pin = nil; loginStatus = nil
     }
 
-    private func runPinFlow(clientID cid: String) async {
+    private func requestDeviceCode(clientID cid: String) async throws -> DeviceAuthorization {
+        // media:write is needed for scrobbling and Add to Watchlist; omitting scope would give a read-only token.
+        let r = oauthRequest("/oauth2/device", form: ["client_id": cid, "scope": "media:read media:write"])
+        let (d, resp) = try await URLSession.shared.data(for: r)
+        let code = Self.status(resp)
+        let dec = JSONDecoder(); dec.keyDecodingStrategy = .convertFromSnakeCase
+        if code == 200 { return try dec.decode(DeviceAuthorization.self, from: d) }
+        let e = try? dec.decode(OAuthError.self, from: d)
+        if e?.error == "invalid_client" {
+            throw SimklError.message("Simkl doesn't accept this client ID for the device flow. It must belong to an AUTH V2 app (simkl.com/settings/developer).")
+        }
+        throw SimklError.http(code, e?.errorDescription ?? Self.snippet(d))
+    }
+
+    private func runDeviceFlow(clientID cid: String) async {
         do {
             loginStatus = "Requesting a code…"
-            let p: PinResponse = try await send(request("/oauth/pin", query: ["client_id": cid], auth: false))
-            if let r = p.result, r.uppercased() != "OK" { throw SimklError.message("Simkl refused the request (\(r)). Check your client ID.") }
+            let p = try await requestDeviceCode(clientID: cid)
             pin = p
             loginStatus = "Open the page below and enter the code."
             let deadline = Date().addingTimeInterval(Double(p.expiresIn))
-            let wait = max(p.interval, 1)               // never faster than the interval Simkl asked for
+            var wait = max(p.interval ?? 5, 1)          // never faster than the interval Simkl asked for
             var failures = 0
             while Date() < deadline {
                 try await Task.sleep(for: .seconds(wait))
                 try Task.checkCancellation()
-                switch await poll(code: p.userCode, clientID: cid) {
-                case .token(let t):
-                    token = t
-                    Keychain.set(t, "simkl.token")
+                switch await poll(deviceCode: p.deviceCode, clientID: cid) {
+                case .tokens(let t):
+                    storeTokens(t)
                     pin = nil; loginStatus = nil; loginError = nil
                     await sync(force: true)
+                    if let s = t.scope, !s.contains("media:write") {
+                        syncError = "Connected read-only: scrobbling and Add to Watchlist need the media:write permission."
+                    }
                     return
                 case .pending:
+                    failures = 0
+                case .slowDown:
+                    wait += 5                           // Simkl asks for +5 s; the sleep above is the wait itself
                     failures = 0
                 case .failed(let m):
                     pin = nil; loginStatus = nil; loginError = m
@@ -162,27 +237,89 @@ final class SimklStore {
         }
     }
 
-    private func poll(code: String, clientID cid: String) async -> PollResult {
-        let r = request("/oauth/pin/\(code)", query: ["client_id": cid], auth: false)
+    private func poll(deviceCode: String, clientID cid: String) async -> PollResult {
+        let r = oauthRequest("/oauth2/token", form: [
+            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            "client_id": cid,
+            "device_code": deviceCode,
+        ])
         guard let (d, resp) = try? await URLSession.shared.data(for: r) else { return .transient }
-        let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
-        if status == 429 || status >= 500 { return .transient }
+        let status = Self.status(resp)
+        if status == 429 { return .slowDown }
+        if status >= 500 { return .transient }
         let dec = JSONDecoder(); dec.keyDecodingStrategy = .convertFromSnakeCase
-        guard let p = try? dec.decode(PollResponse.self, from: d) else {
-            return status == 200 ? .pending : .failed("Simkl answered HTTP \(status): \(Self.snippet(d))")
+        if status == 200 {
+            guard let t = try? dec.decode(TokenResponse.self, from: d), !t.accessToken.isEmpty else {
+                return .failed("Simkl sent a sign-in response the app couldn't read.")
+            }
+            return .tokens(t)
         }
-        if let t = p.accessToken, !t.isEmpty, (p.result ?? "OK").uppercased() == "OK" { return .token(t) }
-        // "KO" means not authorised yet. Only give up on messages that clearly say the code is dead.
-        let m = (p.message ?? "").lowercased()
-        if m.contains("expire") || m.contains("invalid") || m.contains("denied") || m.contains("not found") {
-            return .failed(p.message ?? "Simkl rejected the code.")
+        // Declining on the approval page is never signalled: it looks like "pending" until the code expires.
+        switch (try? dec.decode(OAuthError.self, from: d))?.error {
+        case "authorization_pending": return .pending
+        case "slow_down": return .slowDown
+        case "expired_token": return .failed("The code expired. Tap Connect to get a new one.")
+        case "invalid_client":
+            return .failed("Simkl rejected the client ID. It must belong to an AUTH V2 app (simkl.com/settings/developer).")
+        default: return .failed("Simkl answered HTTP \(status): \(Self.snippet(d))")
         }
-        return .pending
+    }
+
+    // MARK: Tokens (7-day access token, 180-day non-rotating refresh token)
+
+    private func storeTokens(_ t: TokenResponse) {
+        token = t.accessToken
+        Keychain.set(t.accessToken, "simkl.token")
+        if let r = t.refreshToken, !r.isEmpty { refreshToken = r; Keychain.set(r, "simkl.refresh") }
+        let exp = Date().addingTimeInterval(Double(t.expiresIn ?? 604_800))
+        tokenExpiry = exp
+        UserDefaults.standard.set(exp, forKey: Self.expiryKey)
+    }
+
+    /// Refreshes when the access token is within a day of expiring (or `force`, after a 401).
+    /// Returns whether a usable token is held afterwards.
+    @discardableResult
+    private func refreshIfNeeded(force: Bool = false) async -> Bool {
+        guard isConnected else { return false }
+        guard let rt = refreshToken else { return !force }          // token from before V2 has no refresh token
+        if !force {
+            guard let exp = tokenExpiry, exp.timeIntervalSinceNow < 86_400 else { return true }
+        }
+        if let running = refreshTask { return await running.value }
+        let cid = clientID
+        let task = Task { await performRefresh(rt, clientID: cid) }
+        refreshTask = task
+        let ok = await task.value
+        refreshTask = nil
+        return ok
+    }
+
+    private func performRefresh(_ rt: String, clientID cid: String) async -> Bool {
+        let r = oauthRequest("/oauth2/token", form: ["grant_type": "refresh_token", "client_id": cid, "refresh_token": rt])
+        guard let (d, resp) = try? await URLSession.shared.data(for: r) else { return false }   // offline: keep what we have
+        let status = Self.status(resp)
+        let dec = JSONDecoder(); dec.keyDecodingStrategy = .convertFromSnakeCase
+        if status == 200, let t = try? dec.decode(TokenResponse.self, from: d), !t.accessToken.isEmpty {
+            storeTokens(t)
+            return true
+        }
+        if status == 400 || status == 401 {
+            // Grant revoked or refresh token past its 180 days: only a new sign-in helps.
+            syncError = "Simkl login expired. Disconnect and connect again."
+        }
+        return false
     }
 
     func disconnect() {
-        loginTask?.cancel(); token = nil; pin = nil; library = []; loginStatus = nil; syncError = nil
-        Keychain.remove("simkl.token")
+        loginTask?.cancel(); pin = nil; library = []; loginStatus = nil; syncError = nil
+        // Revoking either token ends the whole grant. Fire and forget: the endpoint always answers 200.
+        if let rt = refreshToken {
+            let r = oauthRequest("/oauth2/revoke", form: ["client_id": clientID, "token": rt])
+            Task { _ = try? await URLSession.shared.data(for: r) }
+        }
+        token = nil; refreshToken = nil; tokenExpiry = nil
+        Keychain.remove("simkl.token"); Keychain.remove("simkl.refresh")
+        UserDefaults.standard.removeObject(forKey: Self.expiryKey)
     }
 
     // MARK: Library
@@ -192,7 +329,7 @@ final class SimklStore {
         if !force, let l = lastSync, Date().timeIntervalSince(l) < 900 { return }
         isSyncing = true; defer { isSyncing = false }
         let all: AllItems
-        do { all = try await send(request("/sync/all-items/")) }
+        do { all = try await sendAuthed { request("/sync/all-items/") } }
         catch {
             if case SimklError.http(let c, _) = error, c == 401 || c == 403 {
                 syncError = "Simkl rejected the saved login. Disconnect and connect again."
@@ -222,6 +359,7 @@ final class SimklStore {
 
     func addToWatchlist(_ imdb: String, type: String) async {
         let body: [String: Any] = [type == "series" ? "shows" : "movies": [["to": "plantowatch", "ids": ["imdb": imdb]]]]
+        await refreshIfNeeded()
         _ = try? await URLSession.shared.data(for: request("/sync/add-to-list", method: "POST", body: body))
         await sync(force: true)
     }
@@ -233,7 +371,9 @@ final class SimklStore {
         if let s = r.season, let e = r.episode {
             body["show"] = ["ids": ["imdb": r.imdb]]; body["episode"] = ["season": s, "number": e]
         } else { body["movie"] = ["ids": ["imdb": r.imdb]] }
-        let req = request("/scrobble/\(action)", method: "POST", body: body)
-        Task { _ = try? await URLSession.shared.data(for: req) }
+        Task {
+            await refreshIfNeeded()
+            _ = try? await URLSession.shared.data(for: request("/scrobble/\(action)", method: "POST", body: body))
+        }
     }
 }
