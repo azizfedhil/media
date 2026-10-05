@@ -88,7 +88,11 @@ final class PlayerModel {
         resetForNewItem()
         do {
             if replacing { engine.stop() }
-            try await engine.load(url: r.url, options: LoadOptions(httpHeaders: r.headers))
+            // Prefetch the entire source to disk from the first byte, wherever the playhead is. The engine bounds
+            // this by a byte budget tied to free storage, buffers as much as safely fits, then tracks playback.
+            var options = LoadOptions(httpHeaders: r.headers)
+            options.forwardBufferSegments = Int.max
+            try await engine.load(url: r.url, options: options)
             // The screen may have been closed while the source was loading.
             if isShutDown { engine.stop(); return }
             engine.play()
@@ -502,25 +506,41 @@ struct PlayerScreen: View {
         .disabled(provider == nil)
     }
 
-    /// Speed, episodes, sources, subtitles, audio, next.
+    /// Speed, episodes, sources, subtitles, audio, next: all inside one Liquid Glass pill.
     private var iconRow: some View {
-        HStack(spacing: 12) {
-            circleButton("speedometer", size: 46, icon: 19,
-                         tint: (showSpeed || model.rate != 1) ? theme.accent : nil) { toggleSpeed() }
-            if provider != nil { circleButton("list.bullet", size: 46, icon: 19) { openEpisodes() } }
-            circleButton("rectangle.stack", size: 46, icon: 19) { openSources() }
+        HStack(spacing: 2) {
+            pillButton("speedometer", active: showSpeed || model.rate != 1) { toggleSpeed() }
+            if provider != nil { pillButton("list.bullet") { openEpisodes() } }
+            pillButton("rectangle.stack") { openSources() }
             if !model.subtitleTracks.isEmpty {
-                circleButton(model.activeSubtitleID == nil ? "captions.bubble" : "captions.bubble.fill",
-                             size: 46, icon: 19, tint: showSubtitles ? theme.accent : nil) { toggleSubtitles() }
+                pillButton(model.activeSubtitleID == nil ? "captions.bubble" : "captions.bubble.fill",
+                           active: showSubtitles) { toggleSubtitles() }
             }
             if model.audioTracks.count > 1 { audioMenu }
             if nextEp != nil { nextButton }
         }
+        .padding(4)
+        .modifier(GlassCapsule(on: glass))
+    }
+
+    /// Icon inside the pill: no glass of its own, an accent disc when active.
+    private func pillButton(_ symbol: String, active: Bool = false, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 19, weight: .semibold))
+                .foregroundStyle(.white)
+                .contentTransition(.symbolEffect(.replace))
+                .animation(.snappy(duration: 0.2), value: symbol)
+                .frame(width: 46, height: 46)
+                .background { if active { Circle().fill(theme.accent.opacity(0.6)) } }
+                .contentShape(Circle())
+        }
+        .buttonStyle(PressableStyle())
     }
 
     private var nextButton: some View {
         ZStack {
-            circleButton("forward.end.fill", size: 46, icon: 18) { playNext() }
+            pillButton("forward.end.fill") { playNext() }
                 .opacity(switching != nil ? 0.35 : 1)
                 .disabled(switching != nil)
             if switching != nil { ProgressView().tint(.white).allowsHitTesting(false) }
@@ -563,7 +583,7 @@ struct PlayerScreen: View {
             }
         } label: {
             Image(systemName: "speaker.wave.2").font(.system(size: 19, weight: .semibold)).foregroundStyle(.white)
-                .frame(width: 46, height: 46).modifier(GlassCircle(on: glass)).contentShape(Circle())
+                .frame(width: 46, height: 46).contentShape(Circle())
         }
         .menuIndicator(.hidden)
         .tint(.white)
