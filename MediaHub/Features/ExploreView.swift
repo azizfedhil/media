@@ -77,6 +77,7 @@ struct ExploreView: View {
                 } else { content }
             }
             .navigationTitle("Explore")
+            .profileToolbar()
             .navigationDestination(for: MetaPreview.self) { DetailView(item: $0) }
         }
         .task(id: tmdbKey) {
