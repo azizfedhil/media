@@ -112,6 +112,7 @@ struct SettingsView: View {
                 }
             }
             .navigationTitle("Settings")
+            .profileToolbar()
             .scrollDismissesKeyboard(.interactively)
             .toolbar {
                 ToolbarItemGroup(placement: .keyboard) {
