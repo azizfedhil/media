@@ -1,8 +1,7 @@
 name: Build IPA
+# Manual only: run it from the Actions tab -> "Build IPA" -> "Run workflow".
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
 jobs:
   build:
     runs-on: macos-26
