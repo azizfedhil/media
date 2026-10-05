@@ -92,6 +92,7 @@ struct SearchView: View {
                 }
             }
             .navigationTitle("Search")
+            .profileToolbar()
             .navigationDestination(for: MetaPreview.self) { DetailView(item: $0) }
             .navigationDestination(for: CatalogRow.self) { CatalogGridView(row: $0) }
         }
