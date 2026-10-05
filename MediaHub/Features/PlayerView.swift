@@ -45,6 +45,8 @@ final class PlayerModel {
     var activeAudioID: Int?
     var activeSubtitleID: Int?
     var activeCues: [SubCue] = []
+    /// Playback speed, 0.5...2.0 in continuous steps. The engine clamps it again to what the active backend supports.
+    private(set) var rate: Double = 1.0
     private(set) var engine: AetherEngine?
 
     let playhead = Playhead()
@@ -61,6 +63,9 @@ final class PlayerModel {
     @ObservationIgnored private var isShutDown = false
     @ObservationIgnored private var preferredSubtitleLanguage: String?
     @ObservationIgnored private var autoSelectSubtitle = false
+    @ObservationIgnored private var rateTask: Task<Void, Never>?
+    /// The engine may drop back to 1x on a (re)load, seek or pause; the chosen speed is pushed again on the next `.playing`.
+    @ObservationIgnored private var rateStale = false
 
     /// The viewer's default subtitle language (nil = off). Applied when tracks become available.
     func configure(defaultSubtitleLanguage lang: String?) {
@@ -104,6 +109,7 @@ final class PlayerModel {
         activeSubtitleID = nil; subtitleTracks = []; audioTracks = []; activeAudioID = nil
         // Default language on first start, then whatever the viewer picked, across episodes.
         autoSelectSubtitle = preferredSubtitleLanguage != nil
+        rateStale = rate != 1
     }
 
     private func bind(_ engine: AetherEngine) {
@@ -111,9 +117,11 @@ final class PlayerModel {
         engine.$state.receive(on: DispatchQueue.main).sink { [weak self] s in
             guard let self else { return }
             switch s {
-            case .playing: isPlaying = true; isPaused = false; setBuffering(false); error = nil; refreshTracks()
-            case .paused: isPlaying = false; isPaused = true; setBuffering(false)
-            case .loading, .seeking: isPaused = false; setBuffering(true)
+            case .playing:
+                isPlaying = true; isPaused = false; setBuffering(false); error = nil; refreshTracks()
+                if rateStale { pushRate() }
+            case .paused: isPlaying = false; isPaused = true; setBuffering(false); rateStale = rate != 1
+            case .loading, .seeking: isPaused = false; setBuffering(true); rateStale = rate != 1
             case .ended: isPlaying = false; isPaused = false; setBuffering(false); didEnd = true
             case .error: isPlaying = false; isPaused = false; setBuffering(false); error = "Playback failed (\(String(describing: s)))."
             default: break
@@ -231,6 +239,32 @@ final class PlayerModel {
 
     func togglePlay() { engine?.togglePlayPause() }
 
+    // MARK: Playback speed
+
+    /// Continuous speed control. Values are rounded to 0.01 and snap to exactly 1x near the middle. While the slider
+    /// is dragged the engine is only told about the latest value, ~90 ms after the last change.
+    func setRate(_ r: Double) {
+        let v = min(max(r, 0.5), 2.0)
+        rate = abs(v - 1) < 0.025 ? 1 : (v * 100).rounded() / 100
+        rateTask?.cancel()
+        // Setting a rate on a paused player could start it, so a paused change waits for the next `.playing`.
+        guard isPlaying else { rateStale = true; return }
+        rateTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(90))
+            guard !Task.isCancelled, let self else { return }
+            pushRate()
+        }
+    }
+
+    private func pushRate() {
+        guard let engine else { return }
+        rateStale = false
+        // `setRate` takes the engine's own float type; the generic helper keeps this compiling for Float or Double.
+        Self.apply(engine.setRate, rate)
+    }
+
+    private static func apply<T: BinaryFloatingPoint>(_ f: (T) -> Void, _ v: Double) { f(T(v)) }
+
     private func clamp(_ t: Double) -> Double {
         min(max(t, 0), playhead.duration > 0 ? playhead.duration : max(t, 0))
     }
@@ -268,7 +302,7 @@ final class PlayerModel {
     func shutdown() {
         guard !isShutDown else { return }
         isShutDown = true
-        spinnerTask?.cancel(); seekTask?.cancel()
+        spinnerTask?.cancel(); seekTask?.cancel(); rateTask?.cancel()
         bag.removeAll()
         engine?.stop()
     }
@@ -315,6 +349,7 @@ struct PlayerScreen: View {
     @Environment(WatchHistory.self) private var history
     @Environment(SimklStore.self) private var simkl
     @Environment(ThemeStore.self) private var theme
+    @Environment(AddonStore.self) private var store
     @Environment(\.openURL) private var openURL
     @AppStorage(SubtitleStyle.storageKey) private var subJSON = ""
     @AppStorage("sub.lang") private var subLang = "off"
@@ -326,6 +361,10 @@ struct PlayerScreen: View {
     @State private var showControls = true
     @State private var showEpisodes = false
     @State private var showSubtitles = false
+    @State private var showSources = false
+    @State private var showSpeed = false
+    @State private var sourceGroups: [(Addon, [StreamItem])] = []
+    @State private var loadingSources = false
     @State private var hideTask: Task<Void, Never>?
     @State private var scrobbled = false
     @State private var closing = false
@@ -345,17 +384,19 @@ struct PlayerScreen: View {
         ZStack {
             Color.black.ignoresSafeArea()
             if let engine = model.engine { AetherPlayerSurface(engine: engine).ignoresSafeArea() }
-            SubtitleOverlay(cues: model.activeCues, lift: showControls ? 118 : 0, style: SubtitleStyle.decode(subJSON))
+            SubtitleOverlay(cues: model.activeCues, lift: showControls ? 112 : 0, style: SubtitleStyle.decode(subJSON))
                 .animation(.easeInOut(duration: 0.2), value: showControls)
             Color.clear.contentShape(Rectangle()).onTapGesture { tapBackground() }
-            if model.isPaused && model.error == nil && !showEpisodes && !showSubtitles { pausedOverlay }
+            if model.isPaused && model.error == nil && !showEpisodes && !showSubtitles && !showSources && !showSpeed { pausedOverlay }
             if model.showSpinner && model.error == nil && !showControls && !showEpisodes {
                 ProgressView().controlSize(.large).tint(.white)
             }
             if showControls || model.error != nil { controls.transition(.opacity) }
-            if !showEpisodes && !showSubtitles && model.error == nil { skipLayer }
+            if !showEpisodes && !showSubtitles && !showSources && !showSpeed && model.error == nil { skipLayer }
             if showEpisodes, let provider { episodePanel(provider).transition(.move(edge: .bottom).combined(with: .opacity)) }
             if showSubtitles { subtitlePanel.transition(.move(edge: .trailing).combined(with: .opacity)) }
+            if showSources { sourcesPanel.transition(.move(edge: .trailing).combined(with: .opacity)) }
+            if showSpeed { speedLayer.transition(.move(edge: .bottom).combined(with: .opacity)) }
             if let e = model.error { errorCard(e) }
             if let n = notice { toast(n) }
         }
@@ -397,7 +438,7 @@ struct PlayerScreen: View {
             VStack(spacing: 0) {
                 LinearGradient(colors: [.black.opacity(0.5), .clear], startPoint: .top, endPoint: .bottom).frame(height: 100)
                 Spacer()
-                LinearGradient(colors: [.clear, .black.opacity(0.78)], startPoint: .top, endPoint: .bottom).frame(height: 230)
+                LinearGradient(colors: [.clear, .black.opacity(0.8)], startPoint: .top, endPoint: .bottom).frame(height: 260)
             }
             .ignoresSafeArea().allowsHitTesting(false)
 
@@ -408,7 +449,7 @@ struct PlayerScreen: View {
                 Spacer()
                 bottomBar
             }
-            .padding(.horizontal, 20).padding(.top, 4).padding(.bottom, 8)
+            .padding(.horizontal, 24).padding(.top, 4).padding(.bottom, 6)
         }
         .foregroundStyle(.white)
     }
@@ -425,60 +466,65 @@ struct PlayerScreen: View {
         }
     }
 
-    /// Series name + episode directly above the seek bar (tap the name for episodes), then the seek bar,
-    /// then the icon row: subtitles, audio, next episode.
+    /// Bottom stack: title and episode line on the left, icon buttons on the right, both directly above the glass
+    /// seek bar, which sits at the very bottom. In a narrow window the icons drop below the text.
     private var bottomBar: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Button { openEpisodes() } label: {
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 6) {
-                        Text(current.item.name).font(.system(size: 17, weight: .semibold)).lineLimit(1)
-                        if provider != nil { Image(systemName: "chevron.up").font(.system(size: 11, weight: .bold)).opacity(0.85) }
-                    }
-                    if let l = subtitleLine {
-                        Text(l).font(.system(size: 13, weight: .medium)).foregroundStyle(.white.opacity(0.7)).lineLimit(1)
-                    }
+        VStack(alignment: .leading, spacing: 10) {
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .bottom, spacing: 16) { titleBlock; iconRow }
+                VStack(alignment: .leading, spacing: 12) {
+                    titleBlock
+                    HStack { Spacer(minLength: 0); iconRow }
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
-            .disabled(provider == nil)
-
-            SeekBar(playhead: model.playhead,
+            SeekBar(playhead: model.playhead, glass: glass,
                     onScrubStart: { hideTask?.cancel() },
                     onCommit: { t in Task { await model.seek(to: t); scheduleHide() } })
-
-            iconRow
         }
     }
 
+    /// Series name + episode line (tap for the episode list).
+    private var titleBlock: some View {
+        Button { openEpisodes() } label: {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 8) {
+                    Text(current.item.name).font(.system(size: 24, weight: .bold)).lineLimit(1)
+                    if provider != nil { Image(systemName: "chevron.up").font(.system(size: 14, weight: .bold)).opacity(0.85) }
+                }
+                if let l = subtitleLine {
+                    Text(l).font(.system(size: 17, weight: .medium)).foregroundStyle(.white.opacity(0.75)).lineLimit(1)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(provider == nil)
+    }
+
+    /// Speed, episodes, sources, subtitles, audio, next.
     private var iconRow: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 12) {
+            circleButton("speedometer", size: 46, icon: 19,
+                         tint: (showSpeed || model.rate != 1) ? theme.accent : nil) { toggleSpeed() }
+            if provider != nil { circleButton("list.bullet", size: 46, icon: 19) { openEpisodes() } }
+            circleButton("rectangle.stack", size: 46, icon: 19) { openSources() }
             if !model.subtitleTracks.isEmpty {
                 circleButton(model.activeSubtitleID == nil ? "captions.bubble" : "captions.bubble.fill",
-                             size: 42, icon: 17, tint: showSubtitles ? theme.accent : nil) { toggleSubtitles() }
+                             size: 46, icon: 19, tint: showSubtitles ? theme.accent : nil) { toggleSubtitles() }
             }
             if model.audioTracks.count > 1 { audioMenu }
-            Spacer()
             if nextEp != nil { nextButton }
         }
     }
 
     private var nextButton: some View {
-        Button { playNext() } label: {
-            HStack(spacing: 7) {
-                if switching != nil { ProgressView().tint(.white).controlSize(.small) }
-                else { Image(systemName: "forward.end.fill").font(.system(size: 13, weight: .bold)) }
-                Text("Next").font(.system(size: 14, weight: .semibold))
-            }
-            .foregroundStyle(.white)
-            .padding(.horizontal, 16).frame(height: 42)
-            .modifier(GlassCapsule(on: glass))
-            .contentShape(Capsule())
+        ZStack {
+            circleButton("forward.end.fill", size: 46, icon: 18) { playNext() }
+                .opacity(switching != nil ? 0.35 : 1)
+                .disabled(switching != nil)
+            if switching != nil { ProgressView().tint(.white).allowsHitTesting(false) }
         }
-        .buttonStyle(PressableStyle())
-        .disabled(switching != nil)
     }
 
     /// "S1 · E3 · Episode title", or the movie's year.
@@ -516,8 +562,8 @@ struct PlayerScreen: View {
                 }
             }
         } label: {
-            Image(systemName: "speaker.wave.2").font(.system(size: 17, weight: .semibold)).foregroundStyle(.white)
-                .frame(width: 42, height: 42).modifier(GlassCircle(on: glass)).contentShape(Circle())
+            Image(systemName: "speaker.wave.2").font(.system(size: 19, weight: .semibold)).foregroundStyle(.white)
+                .frame(width: 46, height: 46).modifier(GlassCircle(on: glass)).contentShape(Circle())
         }
         .menuIndicator(.hidden)
         .tint(.white)
@@ -569,7 +615,7 @@ struct PlayerScreen: View {
             Spacer(minLength: 0)
             VStack(alignment: .leading, spacing: 14) {
                 HStack {
-                    Text("Subtitles").font(.headline)
+                    Text("Subtitles").font(.title3.weight(.semibold))
                     Spacer()
                     circleButton("xmark", size: 34, icon: 13) { closeSubtitles() }
                 }
@@ -599,9 +645,9 @@ struct PlayerScreen: View {
     private func trackRow(_ title: String, on: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             HStack {
-                Text(title).font(.subheadline.weight(.medium)).lineLimit(1)
+                Text(title).font(.body.weight(.medium)).lineLimit(1)
                 Spacer()
-                if on { Image(systemName: "checkmark").font(.footnote.weight(.bold)).foregroundStyle(theme.accent) }
+                if on { Image(systemName: "checkmark").font(.subheadline.weight(.bold)).foregroundStyle(theme.accent) }
             }
             .padding(.horizontal, 12).padding(.vertical, 10)
             .background(Color.white.opacity(on ? 0.16 : 0.07), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
@@ -614,12 +660,185 @@ struct PlayerScreen: View {
         hideTask?.cancel()
         if showSubtitles { closeSubtitles(); return }
         // Controls get out of the way so the subtitles can be judged where they will really appear.
-        withAnimation(.snappy(duration: 0.3)) { showSubtitles = true; showEpisodes = false; showControls = false }
+        withAnimation(.snappy(duration: 0.3)) { showSubtitles = true; showEpisodes = false; showSources = false; showSpeed = false; showControls = false }
     }
 
     private func closeSubtitles() {
         withAnimation(.snappy(duration: 0.3)) { showSubtitles = false; showControls = true }
         scheduleHide()
+    }
+
+    // MARK: Speed panel
+
+    /// Floats above the icon row; the video keeps playing and the controls stay up while it is open.
+    private var speedLayer: some View {
+        VStack {
+            Spacer()
+            HStack {
+                Spacer()
+                speedPanel
+            }
+            .padding(.trailing, 20)
+            .padding(.bottom, 118)
+        }
+    }
+
+    private var speedPanel: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text("Playback speed").font(.title3.weight(.semibold))
+                Spacer()
+                Text(rateText(model.rate)).font(.title3.weight(.bold).monospacedDigit())
+                    .foregroundStyle(model.rate == 1 ? Color.white : theme.accent)
+                circleButton("xmark", size: 34, icon: 13) { closeSpeed() }
+            }
+            HStack(spacing: 12) {
+                Image(systemName: "tortoise.fill").font(.system(size: 18)).foregroundStyle(.white.opacity(0.7))
+                Slider(value: Binding(get: { model.rate }, set: { model.setRate($0) }), in: 0.5...2.0)
+                    .tint(.white)
+                Image(systemName: "hare.fill").font(.system(size: 18)).foregroundStyle(.white.opacity(0.7))
+            }
+            HStack {
+                Text("0.5×")
+                Spacer()
+                Button("Reset to 1×") { model.setRate(1) }
+                    .buttonStyle(.plain).fontWeight(.semibold)
+                    .opacity(model.rate == 1 ? 0.35 : 1).disabled(model.rate == 1)
+                Spacer()
+                Text("2×")
+            }
+            .font(.subheadline.monospacedDigit()).foregroundStyle(.white.opacity(0.75))
+        }
+        .foregroundStyle(.white)
+        .padding(18)
+        .frame(width: 360)
+        .modifier(GlassCard(on: glass))
+    }
+
+    private func rateText(_ r: Double) -> String {
+        var t = String(format: "%.2f", r)
+        while t.hasSuffix("0") { t.removeLast() }
+        if t.hasSuffix(".") { t.removeLast() }
+        return t + "×"
+    }
+
+    private func toggleSpeed() {
+        hideTask?.cancel()
+        if showSpeed { closeSpeed(); return }
+        withAnimation(.snappy(duration: 0.3)) { showSpeed = true; showSubtitles = false; showSources = false; showEpisodes = false }
+    }
+
+    private func closeSpeed() {
+        withAnimation(.snappy(duration: 0.3)) { showSpeed = false }
+        scheduleHide()
+    }
+
+    // MARK: Sources panel
+
+    private var sourcesPanel: some View {
+        HStack(spacing: 0) {
+            Spacer(minLength: 0)
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    Text("Sources").font(.title3.weight(.semibold))
+                    Spacer()
+                    circleButton("xmark", size: 34, icon: 13) { closeSources() }
+                }
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 18) {
+                        if loadingSources && sourceGroups.isEmpty {
+                            ProgressView().tint(.white).frame(maxWidth: .infinity).padding(.top, 30)
+                        }
+                        ForEach(sourceGroups, id: \.0.id) { addon, items in
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(addon.manifest.name.uppercased()).font(.caption.weight(.bold)).tracking(1)
+                                    .foregroundStyle(.white.opacity(0.6))
+                                ForEach(items) { s in sourceRow(addon, s) }
+                            }
+                        }
+                        if !loadingSources && sourceGroups.isEmpty {
+                            Text("No playable sources found for this title.")
+                                .font(.subheadline).foregroundStyle(.white.opacity(0.7))
+                        }
+                    }
+                    .padding(.bottom, 6)
+                }
+                .scrollIndicators(.hidden)
+            }
+            .foregroundStyle(.white)
+            .padding(18)
+            .frame(width: 360)
+            .modifier(GlassCard(on: glass))
+            .padding(.vertical, 10).padding(.trailing, 10)
+        }
+    }
+
+    private func sourceRow(_ addon: Addon, _ s: StreamItem) -> some View {
+        let isCurrent = addon.id == current.sourceAddonID && s.signature == current.sourceSignature
+        let detail = s.description ?? s.title
+        return Button { selectSource(addon, s) } label: {
+            HStack(alignment: .top, spacing: 8) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(s.name ?? s.title ?? "Stream").font(.body.weight(.semibold)).lineLimit(2)
+                    if let d = detail, d != s.name {
+                        Text(d).font(.footnote).foregroundStyle(.white.opacity(0.65)).lineLimit(3)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                if isCurrent { Image(systemName: "checkmark").font(.subheadline.weight(.bold)).foregroundStyle(theme.accent) }
+            }
+            .padding(.horizontal, 12).padding(.vertical, 10)
+            .background(Color.white.opacity(isCurrent ? 0.16 : 0.07), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func openSources() {
+        hideTask?.cancel()
+        sourceGroups = []
+        withAnimation(.snappy(duration: 0.3)) { showSources = true; showSubtitles = false; showEpisodes = false; showSpeed = false; showControls = false }
+        Task { await loadSources() }
+    }
+
+    private func closeSources() {
+        withAnimation(.snappy(duration: 0.3)) { showSources = false; showControls = true }
+        scheduleHide()
+    }
+
+    /// Same query the detail page runs: every add-on that serves this title / episode, playable streams only.
+    private func loadSources() async {
+        loadingSources = true; defer { loadingSources = false }
+        let r = current
+        let sid = (r.season != nil && r.episode != nil) ? "\(r.imdb):\(r.season ?? 0):\(r.episode ?? 0)" : r.imdb
+        let groups = await AddonClient.shared.streams(for: sid, type: r.item.type, addons: store.addons)
+        // Task-group results arrive in completion order; keep the user's add-on order.
+        var ordered: [(Addon, [StreamItem])] = []
+        for a in store.addons {
+            guard let g = groups.first(where: { $0.0.id == a.id }) else { continue }
+            let playable = g.1.filter(\.isPlayable)
+            if !playable.isEmpty { ordered.append((a, playable)) }
+        }
+        guard !Task.isCancelled, showSources else { return }
+        sourceGroups = ordered
+    }
+
+    /// Same episode, different stream: carries the position over and keeps the saved progress.
+    private func selectSource(_ addon: Addon, _ s: StreamItem) {
+        guard let u = s.url.flatMap(URL.init(string:)) else { return }
+        if addon.id == current.sourceAddonID && s.signature == current.sourceSignature { closeSources(); return }
+        let resume = model.playhead.position
+        save()
+        let next = PlayRequest(url: u, headers: s.requestHeaders, item: current.item, key: current.key, imdb: current.imdb,
+                               season: current.season, episode: current.episode, episodeTitle: current.episodeTitle,
+                               logo: current.logo, thumb: current.thumb,
+                               sourceAddonID: addon.id, sourceSignature: s.signature)
+        current = next
+        withAnimation(.snappy(duration: 0.3)) { showSources = false; showControls = true }
+        Task {
+            await model.start(next, resume: resume, replacing: true)
+            scheduleHide()
+        }
     }
 
     // MARK: Episode carousel
@@ -638,7 +857,7 @@ struct PlayerScreen: View {
     private func openEpisodes() {
         guard provider != nil else { return }
         hideTask?.cancel()
-        withAnimation(.snappy(duration: 0.3)) { showEpisodes = true; showSubtitles = false; showControls = false }
+        withAnimation(.snappy(duration: 0.3)) { showEpisodes = true; showSubtitles = false; showSources = false; showSpeed = false; showControls = false }
     }
 
     private func closeEpisodes() {
@@ -676,8 +895,8 @@ struct PlayerScreen: View {
 
     private func toast(_ message: String) -> some View {
         VStack {
-            Text(message).font(.footnote.weight(.semibold)).foregroundStyle(.white)
-                .padding(.horizontal, 14).padding(.vertical, 9)
+            Text(message).font(.subheadline.weight(.semibold)).foregroundStyle(.white)
+                .padding(.horizontal, 16).padding(.vertical, 10)
                 .background(.black.opacity(0.78), in: Capsule())
                 .padding(.top, 18)
             Spacer()
@@ -694,7 +913,7 @@ struct PlayerScreen: View {
             Color.black.opacity(0.4).ignoresSafeArea()
             VStack(spacing: 12) {
                 TitleArt(item: current.item, maxWidth: 300, maxHeight: 90, font: .largeTitle.bold(), alignment: .center)
-                if let l = subtitleLine { Text(l).font(.headline).foregroundStyle(.white.opacity(0.85)) }
+                if let l = subtitleLine { Text(l).font(.title3.weight(.medium)).foregroundStyle(.white.opacity(0.85)) }
             }
             .padding(.top, 70)
         }
@@ -737,6 +956,8 @@ struct PlayerScreen: View {
     private func tapBackground() {
         if showEpisodes { closeEpisodes(); return }
         if showSubtitles { closeSubtitles(); return }
+        if showSources { closeSources(); return }
+        if showSpeed { closeSpeed(); return }
         withAnimation(.easeInOut(duration: 0.2)) { showControls.toggle() }
         if showControls { scheduleHide() }
     }
@@ -746,7 +967,7 @@ struct PlayerScreen: View {
         guard model.isPlaying else { return }
         hideTask = Task {
             try? await Task.sleep(for: .seconds(3.5))
-            guard !Task.isCancelled, !model.playhead.scrubbing, !showEpisodes, !showSubtitles else { return }
+            guard !Task.isCancelled, !model.playhead.scrubbing, !showEpisodes, !showSubtitles, !showSources, !showSpeed else { return }
             withAnimation(.easeInOut(duration: 0.25)) { showControls = false }
         }
     }
@@ -788,9 +1009,11 @@ struct PlayerScreen: View {
 
 // MARK: - Seek bar
 
-/// Thin custom scrubber. Reads the playhead itself so only this view redraws on clock ticks.
+/// Liquid Glass scrubber in the style of the Apple TV player: a glass capsule track with a white fill that grows
+/// thicker while you drag, plus a glass thumb. Reads the playhead itself so only this view redraws on clock ticks.
 private struct SeekBar: View {
     let playhead: Playhead
+    let glass: Bool
     var onScrubStart: () -> Void = {}
     let onCommit: (Double) -> Void
     @State private var dragValue: Double?
@@ -800,18 +1023,28 @@ private struct SeekBar: View {
     var body: some View {
         let dur = max(playhead.duration, 1)
         let active = dragValue != nil
-        VStack(spacing: 4) {
+        HStack(spacing: 12) {
+            Text(Fmt.clock(shown)).frame(width: 58, alignment: .leading)
             GeometryReader { geo in
                 let w = max(geo.size.width, 1)
                 let frac = min(max(shown / dur, 0), 1)
-                let h: CGFloat = active ? 8 : 4
-                let knob: CGFloat = active ? 18 : 10
+                let h: CGFloat = active ? 20 : 12
+                let knob: CGFloat = 30
                 ZStack(alignment: .leading) {
-                    Capsule().fill(.white.opacity(0.28)).frame(height: h)
-                    Capsule().fill(.white).frame(width: w * frac, height: h)
-                    Circle().fill(.white).frame(width: knob, height: knob)
-                        .shadow(color: .black.opacity(0.35), radius: 3)
+                    Capsule().fill(Color.clear).frame(height: h)
+                        .modifier(GlassCapsule(on: glass))
+                    // The fill is a plain rectangle clipped by the track shape, so only its left end is rounded.
+                    ZStack(alignment: .leading) {
+                        Rectangle().fill(.white).frame(width: w * frac)
+                    }
+                    .frame(width: w, height: h, alignment: .leading)
+                    .clipShape(Capsule())
+                    Circle().fill(Color.clear).frame(width: knob, height: knob)
+                        .modifier(GlassCircle(on: glass, tint: .white))
                         .offset(x: w * frac - knob / 2)
+                        .scaleEffect(active ? 1 : 0.4)
+                        .opacity(active ? 1 : 0)
+                        .allowsHitTesting(false)
                 }
                 .frame(maxHeight: .infinity)
                 .contentShape(Rectangle())
@@ -828,18 +1061,13 @@ private struct SeekBar: View {
                             onCommit(v)
                         }
                 )
-                .animation(.snappy(duration: 0.15), value: active)
+                .animation(.snappy(duration: 0.18), value: active)
             }
-            .frame(height: 28)
-
-            HStack {
-                Text(Fmt.clock(shown))
-                Spacer()
-                Text("-" + Fmt.clock(max(dur - shown, 0)))
-            }
-            .font(.system(size: 12, weight: .medium).monospacedDigit())
-            .foregroundStyle(.white.opacity(0.75))
+            .frame(height: 40)
+            Text("-" + Fmt.clock(max(dur - shown, 0))).frame(width: 62, alignment: .trailing)
         }
+        .font(.system(size: 14, weight: .semibold).monospacedDigit())
+        .foregroundStyle(.white.opacity(0.85))
     }
 }
 
@@ -879,8 +1107,8 @@ private struct SkipOverlay: View {
             if let c {
                 Button { if let t = c.target { onSeek(t) } else { onNext() } } label: {
                     Label(c.title, systemImage: c.symbol)
-                        .font(.system(size: 15, weight: .semibold)).foregroundStyle(.white)
-                        .padding(.horizontal, 20).frame(height: 44)
+                        .font(.system(size: 17, weight: .semibold)).foregroundStyle(.white)
+                        .padding(.horizontal, 22).frame(height: 48)
                         .modifier(GlassCapsule(on: glass))
                         .contentShape(Capsule())
                 }
@@ -909,7 +1137,7 @@ private struct EpisodePanel: View {
     @State private var episodes: [EpisodeItem] = []
     @State private var loading = true
 
-    private let cardWidth: CGFloat = 220
+    private let cardWidth: CGFloat = 240
     private var cardHeight: CGFloat { cardWidth * 9 / 16 }
 
     init(provider: EpisodeProvider, showName: String, currentSeason: Int?, currentEpisode: Int?,
@@ -927,7 +1155,7 @@ private struct EpisodePanel: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text(showName).font(.system(size: 17, weight: .semibold)).lineLimit(1)
+                Text(showName).font(.system(size: 22, weight: .bold)).lineLimit(1)
                 Spacer()
                 Button(action: onClose) {
                     Image(systemName: "chevron.down").font(.system(size: 13, weight: .bold))
@@ -962,8 +1190,8 @@ private struct EpisodePanel: View {
             HStack(spacing: 8) {
                 ForEach(provider.seasons) { s in
                     Button { season = s.id } label: {
-                        Text(s.title).font(.system(size: 13, weight: .semibold))
-                            .padding(.horizontal, 14).padding(.vertical, 7)
+                        Text(s.title).font(.system(size: 16, weight: .semibold))
+                            .padding(.horizontal, 16).padding(.vertical, 8)
                             .background(s.id == season ? theme.accent : Color.white.opacity(0.14), in: Capsule())
                     }
                     .buttonStyle(PressableStyle())
@@ -984,7 +1212,7 @@ private struct EpisodePanel: View {
                     ForEach(episodes) { ep in card(ep).id(ep.id) }
                     if !loading && episodes.isEmpty {
                         Text("No episode list available for this season")
-                            .font(.footnote).foregroundStyle(.white.opacity(0.7)).frame(height: cardHeight)
+                            .font(.subheadline).foregroundStyle(.white.opacity(0.7)).frame(height: cardHeight)
                     }
                 }
                 .padding(.horizontal, 24)
@@ -1006,13 +1234,13 @@ private struct EpisodePanel: View {
                     .frame(width: cardWidth, height: cardHeight)
                     .overlay { LinearGradient(colors: [.clear, .black.opacity(0.5)], startPoint: .center, endPoint: .bottom) }
                     .overlay(alignment: .bottomLeading) {
-                        Text("E\(ep.id)").font(.system(size: 11, weight: .bold))
+                        Text("E\(ep.id)").font(.system(size: 13, weight: .bold))
                             .padding(.horizontal, 7).padding(.vertical, 3)
                             .background(.black.opacity(0.6), in: Capsule()).padding(8)
                     }
                     .overlay(alignment: .topTrailing) {
                         if isCurrent {
-                            Label("Playing", systemImage: "waveform").font(.system(size: 11, weight: .bold))
+                            Label("Playing", systemImage: "waveform").font(.system(size: 13, weight: .bold))
                                 .padding(.horizontal, 8).padding(.vertical, 4)
                                 .background(theme.accent, in: Capsule()).padding(8)
                         }
@@ -1027,9 +1255,9 @@ private struct EpisodePanel: View {
                         RoundedRectangle(cornerRadius: 12, style: .continuous)
                             .strokeBorder(theme.accent, lineWidth: isCurrent ? 2.5 : 0)
                     }
-                Text(ep.name).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                Text(ep.name).font(.system(size: 16, weight: .semibold)).lineLimit(1)
                     .frame(width: cardWidth, alignment: .leading)
-                Text(extras.isEmpty ? " " : extras).font(.system(size: 11))
+                Text(extras.isEmpty ? " " : extras).font(.system(size: 13))
                     .foregroundStyle(.white.opacity(0.65)).lineLimit(1)
             }
         }
