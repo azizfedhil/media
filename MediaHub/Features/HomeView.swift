@@ -107,7 +107,8 @@ final class HomeModel {
 }
 
 extension CatalogRow {
-    /// Colour of the row's title icon.
+    /// Colour of the row's title icon. ThemeStore is @MainActor, so this must be too.
+    @MainActor
     func accent(_ theme: ThemeStore) -> Color {
         switch id {
         case "because": return theme.accent2
