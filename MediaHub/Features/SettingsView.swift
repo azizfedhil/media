@@ -37,7 +37,7 @@ struct SettingsView: View {
                     Text("TMDB, TheTVDB, MDBList and Simkl: API keys, logins and metadata sources.")
                 }
 
-                Section("Appearance") {
+                Section {
                     VStack(alignment: .leading, spacing: 12) {
                         Text("Accent colour").font(.subheadline.weight(.medium))
                         LazyVGrid(columns: [GridItem(.adaptive(minimum: 40), spacing: 12)], spacing: 12) {
@@ -61,7 +61,7 @@ struct SettingsView: View {
                     .padding(.vertical, 4)
                     Toggle("Network icons on posters", isOn: $networkBadges)
                     Toggle("Logos instead of title text", isOn: $titleLogos)
-                } footer: {
+                } header: { Text("Appearance") } footer: {
                     Text("Network icons need a TMDB key and make one small request per visible poster. Logos come from TMDB, TheTVDB and Metahub and are cached after the first lookup.")
                 }
 
