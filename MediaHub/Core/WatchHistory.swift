@@ -1,7 +1,7 @@
 import Foundation
 import Observation
 
-/// Local progress. Powers Continue Watching, resume, and "Because you watched…" suggestions.
+/// Local progress for the active profile. Powers Continue Watching, resume, and "Because you watched…" suggestions.
 /// (Simkl sync will mirror this later.)
 @MainActor @Observable
 final class WatchHistory {
@@ -29,11 +29,22 @@ final class WatchHistory {
         }
     }
     private(set) var entries: [Entry] = []
-    private let storeKey = "watch.history"
+    @ObservationIgnored private var profileID = ProfileKeys.activeID
+    private var storeKey: String { ProfileKeys.scoped("watch.history", profileID) }
 
-    init() {
-        if let d = UserDefaults.standard.data(forKey: storeKey),
-           let e = try? JSONDecoder().decode([Entry].self, from: d) { entries = e }
+    init() { entries = Self.read(storeKey) }
+
+    /// Switches to another profile's history. No-op when it is already loaded.
+    func load(profile id: String) {
+        guard id != profileID else { return }
+        profileID = id
+        entries = Self.read(storeKey)
+    }
+
+    private static func read(_ key: String) -> [Entry] {
+        guard let d = UserDefaults.standard.data(forKey: key),
+              let e = try? JSONDecoder().decode([Entry].self, from: d) else { return [] }
+        return e
     }
 
     var lastWatched: MetaPreview? { entries.first?.item }
